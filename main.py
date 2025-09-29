@@ -119,10 +119,8 @@ def get_olts():
 
 @app.put("/device/{device_id}")
 def update_device(device_id: int, node_update: NodeUpdate):
-    # 1. Convert the incoming data to a dictionary, excluding any fields that were not sent
     update_data = node_update.dict(exclude_unset=True)
 
-    # If the request body is empty, there's nothing to update
     if not update_data:
         raise HTTPException(status_code=400, detail="No update data provided.")
 
@@ -131,33 +129,60 @@ def update_device(device_id: int, node_update: NodeUpdate):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # 2. Dynamically build the SET part of the SQL query
-        # This creates a list like ["name = :name", "cable_color = :cable_color"]
-        set_clauses = [f"{key} = :{key}" for key in update_data.keys()]
+        # Check if this is a RENAME operation
+        if (
+            "name" in update_data
+            and "original_name" in update_data
+            and "sw_id" in update_data
+        ):
+            # --- RENAME LOGIC ---
+            # Update all records for the device matching the original name and sw_id.
 
-        sql = f"UPDATE nodes SET {', '.join(set_clauses)} WHERE ID = :device_id_bv"
+            # Dynamically build SET clauses for all fields being updated
+            other_updates = {
+                k: v
+                for k, v in update_data.items()
+                if k not in ["original_name", "sw_id"]
+            }
+            set_clauses = [f"{key} = :{key}" for key in other_updates.keys()]
 
-        # 3. Prepare the parameters for the query
-        # This will look like {"name": "NEW NAME", "cable_color": "blue", "device_id_bv": 123}
-        params = update_data.copy()
-        params["device_id_bv"] = device_id
+            sql = f"""
+                UPDATE nodes 
+                SET {', '.join(set_clauses)}
+                WHERE NAME = :original_name 
+                  AND SW_ID = :sw_id
+            """
 
-        # 4. Execute, commit, and check if a row was actually updated
+            params = other_updates
+            params["original_name"] = node_update.original_name
+            params["sw_id"] = node_update.sw_id
+
+        else:
+            # --- SIMPLE UPDATE LOGIC ---
+            # This handles updates for non-name fields (e.g., cable_color)
+            # by updating only the single record specified by the device_id.
+            set_clauses = [f"{key} = :{key}" for key in update_data.keys()]
+            sql = f"UPDATE nodes SET {', '.join(set_clauses)} WHERE ID = :device_id_bv"
+            params = update_data.copy()
+            params["device_id_bv"] = device_id
+
         cursor.execute(sql, params)
 
         if cursor.rowcount == 0:
-            conn.rollback()  # Rollback if no rows were affected
-            raise HTTPException(
-                status_code=404, detail=f"Device with ID {device_id} not found."
+            conn.rollback()
+            detail = (
+                f"No nodes found with name '{node_update.original_name}' for the specified OLT."
+                if "original_name" in update_data
+                else f"Device with ID {device_id} not found."
             )
+            raise HTTPException(status_code=404, detail=detail)
 
-        conn.commit()  # IMPORTANT: Commit the transaction to save changes
-
-        return {"message": f"Device with ID {device_id} updated successfully."}
+        conn.commit()
+        return {"message": "Device update successful."}
 
     except oracledb.Error as e:
         if conn:
-            conn.rollback()  # Rollback on error
+            conn.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:

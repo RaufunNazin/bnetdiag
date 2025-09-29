@@ -8,6 +8,7 @@ class NodeUpdate(BaseModel):
     link_type: Optional[str] = None
     parent_id: Optional[int] = None
     status: Optional[int] = None
+    original_name: Optional[str] = None
     sw_id: Optional[int] = None
     vlan: Optional[int] = None
     cable_color: Optional[str] = None
