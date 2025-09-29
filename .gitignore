@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Logs and coverage
+*.log
+*.coverage
+.coverage.*
+htmlcov/
+*.cover
+
+# Test output
+*.pytest_cache/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.tox/
+.tox/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.tmp
