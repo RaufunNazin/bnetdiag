@@ -12,7 +12,7 @@ def get_data(sw_id: int = None):
         # 1. Start with the base query without the WHERE clause
         sql = """
             SELECT ID, NAME, NVL(NODE_TYPE, null), NVL(LINK_TYPE, null), 
-                   PARENT_ID, STATUS, SW_ID, NVL(VLAN, null), NVL(CABLE_COLOR, 'red'), NVL(CABLE_DESC, null), NVL(LAT1, null), NVL(LONG1, null),
+                   PARENT_ID, STATUS, SW_ID, NVL(VLAN, null), NVL(CABLE_COLOR, 'black'), NVL(CABLE_DESC, null), NVL(LAT1, null), NVL(LONG1, null),
                    NVL(SERIAL_NO, null), NVL(BRAND, null), NVL(MAC, null), 
                    NVL(MODEL, null), NVL(REMARKS, null) 
             FROM nodes
