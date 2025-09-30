@@ -4,7 +4,14 @@ import oracledb
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_connection
 from crud import get_data
-from models import NodeUpdate, NodeCopy, EdgeDeleteByName, NodeDeleteByName
+from models import (
+    NodeUpdate,
+    NodeCopy,
+    EdgeDeleteByName,
+    NodeDeleteByName,
+    NodeCreate,
+    NodeInsert,
+)
 
 # Create the FastAPI application instance
 app = FastAPI(title="netdiag-backend", version="1.0.0")
@@ -88,6 +95,123 @@ def read_data(sw_id: int):
     Endpoint to get data from the 'nodes' table using the get_data function from crud.py.
     """
     return get_data(sw_id=sw_id)
+
+    # ADD THIS NEW ENDPOINT
+
+
+@app.post("/node/insert", status_code=201)
+def insert_node(insert_data: NodeInsert):
+    """
+    Inserts a new node into an existing connection.
+    This version is robust and handles missing optional fields.
+    """
+    plsql_block = """
+        DECLARE
+            v_new_node_id nodes.id%TYPE;
+        BEGIN
+            -- Step 1: Insert the new node.
+            INSERT INTO nodes (
+                id, name, node_type, parent_id, sw_id, link_type, brand, model, 
+                serial_no, mac, ip, split_ratio, split_group, cable_id, 
+                cable_start, cable_end, cable_length, cable_color, cable_desc, 
+                vlan, lat1, long1, remarks
+            ) VALUES (
+                nodes_sq.NEXTVAL, :name, :node_type, :parent_id, :sw_id, :link_type, :brand, :model,
+                :serial_no, :mac, :ip, :split_ratio, :split_group, :cable_id,
+                :cable_start, :cable_end, :cable_length, :cable_color, :cable_desc,
+                :vlan, :lat1, :long1, :remarks
+            ) RETURNING id INTO v_new_node_id;
+
+            -- Step 2: Update the original target node to point to the new node.
+            UPDATE nodes
+            SET parent_id = v_new_node_id
+            WHERE id = :original_target_id;
+            
+        END;
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # --- START: ROBUST PARAMETER HANDLING ---
+        params = insert_data.new_node_data
+
+        # Define all possible keys that the PL/SQL block's INSERT statement expects
+        all_node_keys = [
+            "name", "node_type", "sw_id", "link_type", "brand", "model", "serial_no", 
+            "mac", "ip", "split_ratio", "split_group", "cable_id", "cable_start", 
+            "cable_end", "cable_length", "cable_color", "cable_desc", "vlan", "lat1", 
+            "long1", "remarks"
+        ]
+
+        # Ensure all expected keys exist in the params dictionary, setting them to None if missing
+        for key in all_node_keys:
+            params.setdefault(key, None)
+
+        # Add the other parameters required by the PL/SQL block
+        params['parent_id'] = insert_data.original_source_id
+        params['original_target_id'] = insert_data.original_target_id
+        # --- END: ROBUST PARAMETER HANDLING ---
+
+        cursor.execute(plsql_block, params)
+        conn.commit()
+
+        return {"message": "Node inserted successfully."}
+
+    except oracledb.DatabaseError as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/device", status_code=201)
+def create_node(node: NodeCreate):
+    """
+    Creates a new node in the database.
+    """
+    # Rename 'node_name' from form to 'name' for the database
+    node_data = node.dict(exclude_unset=True)
+    if "node_name" in node_data:
+        node_data["name"] = node_data.pop("node_name")
+    if "device" in node_data:
+        node_data["node_type"] = node_data.pop("device")
+
+    # Prepare SQL statement by dynamically getting columns and bind variables
+    columns = node_data.keys()
+    bind_vars = [f":{col}" for col in columns]
+
+    sql = f"""
+        INSERT INTO nodes (id, {', '.join(columns)}) 
+        VALUES (nodes_sq.NEXTVAL, {', '.join(bind_vars)})
+    """
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, node_data)
+        conn.commit()
+
+        return {"message": f"Node '{node.name}' created successfully."}
+
+    except oracledb.DatabaseError as e:
+        if conn:
+            conn.rollback()
+        # Check for unique constraint violation
+        (error,) = e.args
+        if error.code == 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A node with the same unique properties already exists.",
+            )
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.get("/olts")
@@ -190,25 +314,52 @@ def update_device(node_update: NodeUpdate):
 @app.post("/device/copy", status_code=201)
 def copy_device(copy_request: NodeCopy):
     """
-    Copies a node by its ID, assigning a new parent_id and generating a new unique ID.
+    Connects a device to a new parent.
+    If an orphaned record for the device exists, it updates it.
+    Otherwise, it creates a new record for the connection.
     """
     plsql_block = """
         DECLARE
-          node_record nodes%ROWTYPE;
+          v_orphan_count NUMBER;
+          v_name         nodes.name%TYPE;
+          v_sw_id        nodes.sw_id%TYPE;
+          node_record    nodes%ROWTYPE;
         BEGIN
-          -- 1. Select the entire source row into the record variable
-          SELECT *
-          INTO node_record
+          -- 1. Find the name and sw_id of the source device to identify its group.
+          SELECT name, sw_id
+          INTO v_name, v_sw_id
           FROM nodes
-          WHERE ID = :source_node_id;
+          WHERE id = :source_node_id;
 
-          -- 2. Modify the necessary fields for the new row
-          node_record.ID := nodes_sq.NEXTVAL;
-          node_record.PARENT_ID := :new_parent_id;
+          -- 2. Check if an orphaned record (parent_id is null) already exists.
+          SELECT COUNT(*)
+          INTO v_orphan_count
+          FROM nodes
+          WHERE name = v_name
+            AND sw_id = v_sw_id
+            AND parent_id IS NULL;
 
-          -- 3. Insert the modified record as a new row
-          INSERT INTO nodes VALUES node_record;
-          
+          -- 3. Decide whether to UPDATE the orphan or INSERT a new copy.
+          IF v_orphan_count > 0 THEN
+            -- An orphan exists, so just update it with the new parent.
+            UPDATE nodes
+            SET parent_id = :new_parent_id
+            WHERE name = v_name
+              AND sw_id = v_sw_id
+              AND parent_id IS NULL;
+          ELSE
+            -- No orphan exists, so create a new copy.
+            SELECT *
+            INTO node_record
+            FROM nodes
+            WHERE id = :source_node_id;
+
+            node_record.id := nodes_sq.NEXTVAL;
+            node_record.parent_id := :new_parent_id;
+
+            INSERT INTO nodes VALUES node_record;
+          END IF;
+
           COMMIT;
         END;
     """
@@ -227,18 +378,16 @@ def copy_device(copy_request: NodeCopy):
         cursor.close()
 
         return {
-            "message": f"Device {copy_request.source_node_id} successfully copied to parent {copy_request.new_parent_id}."
+            "message": f"Device {copy_request.source_node_id} successfully connected to parent {copy_request.new_parent_id}."
         }
 
     except oracledb.DatabaseError as e:
         (error,) = e.args
-        # This specifically checks for the "no data found" error from the SELECT...INTO
         if error.code == 1403:
             raise HTTPException(
                 status_code=404,
                 detail=f"Source device with ID {copy_request.source_node_id} not found.",
             )
-        # For all other database errors, raise a 500
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:

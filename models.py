@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 
 
 class NodeUpdate(BaseModel):
@@ -33,3 +33,33 @@ class EdgeDeleteByName(BaseModel):
 class NodeDeleteByName(BaseModel):
     name: str
     sw_id: int
+
+class NodeCreate(BaseModel):
+    name: str
+    sw_id: int
+    parent_id: Optional[int] = None
+    node_type: Optional[str] = None
+    link_type: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    serial_no: Optional[str] = None
+    mac: Optional[str] = None
+    ip: Optional[str] = None
+    split_ratio: Optional[int] = None
+    split_group: Optional[str] = None
+    cable_id: Optional[str] = None
+    cable_start: Optional[int] = None
+    cable_end: Optional[int] = None
+    cable_length: Optional[int] = None
+    cable_color: Optional[str] = None
+    cable_desc: Optional[str] = None
+    lat1: Optional[float] = None
+    long1: Optional[float] = None
+    vlan: Optional[str] = None
+    location: Optional[str] = None
+    remarks: Optional[str] = None
+
+class NodeInsert(BaseModel):
+    new_node_data: Dict[str, Any]
+    original_source_id: int
+    original_target_id: int
