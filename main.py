@@ -117,68 +117,66 @@ def get_olts():
             conn.close()
 
 
-@app.put("/device/{device_id}")
-def update_device(device_id: int, node_update: NodeUpdate):
+@app.put("/device", status_code=200)
+def update_device(node_update: NodeUpdate):
     update_data = node_update.dict(exclude_unset=True)
 
     if not update_data:
         raise HTTPException(status_code=400, detail="No update data provided.")
+
+    # VALIDATION: For any update, we need the original_name and sw_id to identify the group of records.
+    if "original_name" not in update_data or "sw_id" not in update_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Both 'original_name' and 'sw_id' are required to identify the device for any update.",
+        )
 
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Check if this is a RENAME operation
-        if (
-            "name" in update_data
-            and "original_name" in update_data
-            and "sw_id" in update_data
-        ):
-            # --- RENAME LOGIC ---
-            # Update all records for the device matching the original name and sw_id.
+        # --- UNIFIED UPDATE LOGIC ---
+        # All updates (rename, color change, etc.) now apply to all records for the specified device.
 
-            # Dynamically build SET clauses for all fields being updated
-            other_updates = {
-                k: v
-                for k, v in update_data.items()
-                if k not in ["original_name", "sw_id"]
-            }
-            set_clauses = [f"{key} = :{key}" for key in other_updates.keys()]
+        # 1. Prepare the fields to be set in the UPDATE statement.
+        # We exclude the identifiers used in the WHERE clause.
+        fields_to_set = {
+            k: v for k, v in update_data.items() if k not in ["original_name", "sw_id"]
+        }
 
-            sql = f"""
-                UPDATE nodes 
-                SET {', '.join(set_clauses)}
-                WHERE NAME = :original_name 
-                  AND SW_ID = :sw_id
-            """
+        # If there are no actual fields to SET after filtering, there's nothing to do.
+        if not fields_to_set:
+            return {"message": "No data fields were provided to update."}
 
-            params = other_updates
-            params["original_name"] = node_update.original_name
-            params["sw_id"] = node_update.sw_id
+        set_clauses = [f"{key} = :{key}" for key in fields_to_set.keys()]
 
-        else:
-            # --- SIMPLE UPDATE LOGIC ---
-            # This handles updates for non-name fields (e.g., cable_color)
-            # by updating only the single record specified by the device_id.
-            set_clauses = [f"{key} = :{key}" for key in update_data.keys()]
-            sql = f"UPDATE nodes SET {', '.join(set_clauses)} WHERE ID = :device_id_bv"
-            params = update_data.copy()
-            params["device_id_bv"] = device_id
+        # 2. Construct the SQL to update all matching records.
+        sql = f"""
+            UPDATE nodes 
+            SET {', '.join(set_clauses)}
+            WHERE NAME = :original_name 
+              AND SW_ID = :sw_id
+        """
+
+        # 3. Prepare the parameters for the query.
+        params = fields_to_set
+        params["original_name"] = node_update.original_name
+        params["sw_id"] = node_update.sw_id
 
         cursor.execute(sql, params)
 
         if cursor.rowcount == 0:
             conn.rollback()
-            detail = (
-                f"No nodes found with name '{node_update.original_name}' for the specified OLT."
-                if "original_name" in update_data
-                else f"Device with ID {device_id} not found."
+            raise HTTPException(
+                status_code=404,
+                detail=f"No nodes found with name '{node_update.original_name}' for the specified OLT.",
             )
-            raise HTTPException(status_code=404, detail=detail)
 
         conn.commit()
-        return {"message": "Device update successful."}
+        return {
+            "message": f"All records for device '{node_update.original_name}' were updated successfully."
+        }
 
     except oracledb.Error as e:
         if conn:
