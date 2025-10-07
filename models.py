@@ -19,6 +19,7 @@ class NodeUpdate(BaseModel):
     remarks: Optional[str] = None
     position_x: Optional[float] = None
     position_y: Optional[float] = None
+    position_mode: Optional[int] = None
 
 
 class NodeCopy(BaseModel):

@@ -162,7 +162,7 @@ def insert_node(insert_data: NodeInsert):
             "long1",
             "remarks",
             "position_x",
-            "position_y"
+            "position_y",
         ]
 
         for key in all_node_keys:
@@ -362,7 +362,10 @@ def copy_device(copy_request: NodeCopy):
           IF v_orphan_count > 0 THEN
             -- An orphan exists, so just update it with the new parent.
             UPDATE nodes
-            SET parent_id = :new_parent_id
+            SET parent_id = :new_parent_id,
+                position_x = NULL,
+                position_y = NULL,
+                position_mode = 0
             WHERE name = v_name
               AND sw_id = v_sw_id
               AND parent_id IS NULL;
@@ -378,6 +381,15 @@ def copy_device(copy_request: NodeCopy):
 
             INSERT INTO nodes VALUES node_record;
           END IF;
+
+          -- 4. NEW: Reset positions for all sibling nodes that are not manually positioned.
+          -- This will cause the front-end layout algorithm to rearrange the entire group.
+          -- It only affects nodes where position_mode is not 1 (e.g., 0 or NULL).
+          UPDATE nodes
+          SET position_x = NULL,
+              position_y = NULL
+          WHERE parent_id = :new_parent_id
+            AND (position_mode != 1 OR position_mode IS NULL);
 
           COMMIT;
         END;
@@ -470,20 +482,30 @@ def delete_edge(edge_info: EdgeDeleteByName):
           AND SW_ID = :sw_id_bv
           AND PARENT_ID IS NULL;
 
-        -- Step 2: Update the target connection, setting its PARENT_ID to NULL.
-        -- This effectively orphans the record, making it available for future connections.
+        -- Step 2: Update the target connection, setting its PARENT_ID to NULL
+        -- and clearing its position to make it a freshly orphaned node.
+        -- MODIFIED: Added position_x and position_y to the SET clause.
         UPDATE nodes
-        SET PARENT_ID = NULL
+        SET PARENT_ID = NULL,
+            position_x = NULL,
+            position_y = NULL
         WHERE NAME = :name_bv
           AND PARENT_ID = :source_id_bv
           AND SW_ID = :sw_id_bv;
-          
+
         -- Check if the update operation actually changed a row.
         IF SQL%ROWCOUNT = 0 THEN
             -- If no rows were updated, it means the connection didn't exist.
-            -- We raise an application error, which will be caught as an exception.
             RAISE_APPLICATION_ERROR(-20001, 'No matching connection found to update.');
         END IF;
+
+        -- Step 3: NEW - Reset positions for all former sibling nodes that are not manually positioned.
+        -- This will cause the front-end layout algorithm to rearrange the remaining group.
+        UPDATE nodes
+        SET position_x = NULL,
+            position_y = NULL
+        WHERE PARENT_ID = :source_id_bv
+          AND (position_mode != 1 OR position_mode IS NULL);
 
     END;
     """
