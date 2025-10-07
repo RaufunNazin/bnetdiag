@@ -102,30 +102,32 @@ def read_data(sw_id: int):
 @app.post("/node/insert", status_code=201)
 def insert_node(insert_data: NodeInsert):
     """
-    Inserts a new node into an existing connection.
-    This version is robust and handles missing optional fields.
+    Inserts a new node into an existing connection by updating the original
+    connection record to point to the new node.
     """
     plsql_block = """
         DECLARE
             v_new_node_id nodes.id%TYPE;
         BEGIN
-            -- Step 1: Insert the new node.
+            -- Step 1: Insert the new node. Its parent is the original source.
             INSERT INTO nodes (
                 id, name, node_type, parent_id, sw_id, link_type, brand, model, 
                 serial_no, mac, ip, split_ratio, split_group, cable_id, 
                 cable_start, cable_end, cable_length, cable_color, cable_desc, 
-                vlan, lat1, long1, remarks
+                vlan, lat1, long1, remarks, position_x, position_y
             ) VALUES (
                 nodes_sq.NEXTVAL, :name, :node_type, :parent_id, :sw_id, :link_type, :brand, :model,
                 :serial_no, :mac, :ip, :split_ratio, :split_group, :cable_id,
                 :cable_start, :cable_end, :cable_length, :cable_color, :cable_desc,
-                :vlan, :lat1, :long1, :remarks
+                :vlan, :lat1, :long1, :remarks, :position_x, :position_y
             ) RETURNING id INTO v_new_node_id;
 
-            -- Step 2: Update the original target node to point to the new node.
+            -- Step 2: Update the ORIGINAL connection record.
+            -- Instead of connecting to the old target, it now becomes the new node's child.
+            -- We find it by its unique ID.
             UPDATE nodes
             SET parent_id = v_new_node_id
-            WHERE id = :original_target_id;
+            WHERE id = :original_edge_record_id;
             
         END;
     """
@@ -133,26 +135,43 @@ def insert_node(insert_data: NodeInsert):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        
-        # --- START: ROBUST PARAMETER HANDLING ---
+
         params = insert_data.new_node_data
 
-        # Define all possible keys that the PL/SQL block's INSERT statement expects
+        # Corrected list of all possible keys
         all_node_keys = [
-            "name", "node_type", "sw_id", "link_type", "brand", "model", "serial_no", 
-            "mac", "ip", "split_ratio", "split_group", "cable_id", "cable_start", 
-            "cable_end", "cable_length", "cable_color", "cable_desc", "vlan", "lat1", 
-            "long1", "remarks"
+            "name",
+            "node_type",
+            "sw_id",
+            "link_type",
+            "brand",
+            "model",
+            "serial_no",
+            "mac",
+            "ip",
+            "split_ratio",
+            "split_group",
+            "cable_id",
+            "cable_start",
+            "cable_end",
+            "cable_length",
+            "cable_color",
+            "cable_desc",
+            "vlan",
+            "lat1",
+            "long1",
+            "remarks",
+            "position_x",
+            "position_y"
         ]
 
-        # Ensure all expected keys exist in the params dictionary, setting them to None if missing
         for key in all_node_keys:
             params.setdefault(key, None)
 
-        # Add the other parameters required by the PL/SQL block
-        params['parent_id'] = insert_data.original_source_id
-        params['original_target_id'] = insert_data.original_target_id
-        # --- END: ROBUST PARAMETER HANDLING ---
+        params["parent_id"] = insert_data.original_source_id
+        params["original_edge_record_id"] = (
+            insert_data.original_edge_record_id
+        )  # Use the new param
 
         cursor.execute(plsql_block, params)
         conn.commit()
