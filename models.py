@@ -17,6 +17,8 @@ class NodeUpdate(BaseModel):
     mac: Optional[str] = None
     model: Optional[str] = None
     remarks: Optional[str] = None
+    position_x: Optional[float] = None
+    position_y: Optional[float] = None
 
 
 class NodeCopy(BaseModel):
@@ -62,4 +64,4 @@ class NodeCreate(BaseModel):
 class NodeInsert(BaseModel):
     new_node_data: Dict[str, Any]
     original_source_id: int
-    original_target_id: int
+    original_edge_record_id: int # Changed from original_target_id
