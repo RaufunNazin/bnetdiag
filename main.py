@@ -95,7 +95,7 @@ def test_oracle_connection():
 @app.post("/positions/reset", status_code=200)
 def reset_node_positions(reset_request: PositionReset):
     """
-    Resets node positions based on the provided scope. Now handles null sw_id.
+    Resets node positions based on the provided scope. Now correctly scopes the general view.
     """
     base_sql = """
         UPDATE nodes
@@ -109,15 +109,21 @@ def reset_node_positions(reset_request: PositionReset):
     if reset_request.node_id:
         where_clauses.append("id = :node_id")
         params["node_id"] = reset_request.node_id
-        # Note: sw_id is not needed when resetting a single, unique node_id
     elif reset_request.scope:
-        # --- THIS IS THE FIX ---
-        # Dynamically build the clause for sw_id to be null-safe
         if reset_request.sw_id is not None:
+            # Scope is a specific OLT system
             where_clauses.append("sw_id = :sw_id")
             params["sw_id"] = reset_request.sw_id
         else:
-            where_clauses.append("sw_id IS NULL")
+            # --- THIS IS THE FIX ---
+            # Scope is the general view. Use the same logic as the GET /data endpoint.
+            general_view_clause = """
+            (node_type NOT IN ('PON', 'ONU') AND (parent_id IS NULL OR parent_id NOT IN (
+                SELECT id FROM nodes
+                WHERE node_type IN ('OLT', 'PON', 'ONU') AND sw_id IS NOT NULL
+            )))
+            """
+            where_clauses.append(general_view_clause)
 
         if reset_request.scope == "manual":
             where_clauses.append("position_mode = 1")
@@ -141,11 +147,9 @@ def reset_node_positions(reset_request: PositionReset):
         conn.commit()
 
         if cursor.rowcount == 0:
-            return {
-                "message": "No nodes matched the criteria. No positions were reset."
-            }
+            return {"message": "No nodes matched the criteria for reset."}
 
-        return {"message": f"{cursor.rowcount} node positions were reset successfully."}
+        return {"message": f"{cursor.rowcount} node positions were reset."}
     except oracledb.Error as e:
         if conn:
             conn.rollback()
