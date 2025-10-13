@@ -1,4 +1,5 @@
 # main.py
+from typing import Any, Dict, List
 from fastapi import FastAPI, HTTPException, Request
 import oracledb
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,7 @@ from models import (
     NodeDeleteByName,
     NodeCreate,
     NodeInsert,
+    PositionReset,
 )
 
 # Create the FastAPI application instance
@@ -87,6 +89,79 @@ def test_oracle_connection():
         if conn:
             conn.close()
             print("Connection closed.")
+
+
+# Add this new endpoint function anywhere inside main.py
+@app.post("/positions/reset", status_code=200)
+def reset_node_positions(reset_request: PositionReset):
+    """
+    Resets node positions based on the provided scope. Now handles null sw_id.
+    """
+    base_sql = """
+        UPDATE nodes
+        SET position_x = NULL,
+            position_y = NULL,
+            position_mode = 0
+    """
+    where_clauses = []
+    params = {}
+
+    if reset_request.node_id:
+        where_clauses.append("id = :node_id")
+        params["node_id"] = reset_request.node_id
+        # Note: sw_id is not needed when resetting a single, unique node_id
+    elif reset_request.scope:
+        # --- THIS IS THE FIX ---
+        # Dynamically build the clause for sw_id to be null-safe
+        if reset_request.sw_id is not None:
+            where_clauses.append("sw_id = :sw_id")
+            params["sw_id"] = reset_request.sw_id
+        else:
+            where_clauses.append("sw_id IS NULL")
+
+        if reset_request.scope == "manual":
+            where_clauses.append("position_mode = 1")
+        elif reset_request.scope != "all":
+            raise HTTPException(
+                status_code=400, detail="Invalid scope. Must be 'all' or 'manual'."
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either node_id or a scope (with or without sw_id) must be provided.",
+        )
+
+    final_sql = f"{base_sql} WHERE {' AND '.join(where_clauses)}"
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(final_sql, params)
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return {
+                "message": "No nodes matched the criteria. No positions were reset."
+            }
+
+        return {"message": f"{cursor.rowcount} node positions were reset successfully."}
+    except oracledb.Error as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/data", response_model=List[Dict[str, Any]])
+async def read_general_data():
+    """
+    Endpoint for the general network view.
+    Calls get_data without an sw_id.
+    """
+    return get_data(sw_id=None)
 
 
 @app.get("/data/{sw_id}")
@@ -260,18 +335,19 @@ def get_olts():
             conn.close()
 
 
+# In main.py
+
+
 @app.put("/device", status_code=200)
 def update_device(node_update: NodeUpdate):
     update_data = node_update.dict(exclude_unset=True)
 
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No update data provided.")
-
-    # VALIDATION: For any update, we need the original_name and sw_id to identify the group of records.
-    if "original_name" not in update_data or "sw_id" not in update_data:
+    # --- FIX: Updated validation ---
+    # We always need original_name to identify the record. sw_id is optional but used for uniqueness.
+    if "original_name" not in update_data:
         raise HTTPException(
             status_code=400,
-            detail="Both 'original_name' and 'sw_id' are required to identify the device for any update.",
+            detail="'original_name' is required to identify the device.",
         )
 
     conn = None
@@ -279,33 +355,32 @@ def update_device(node_update: NodeUpdate):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # --- UNIFIED UPDATE LOGIC ---
-        # All updates (rename, color change, etc.) now apply to all records for the specified device.
-
-        # 1. Prepare the fields to be set in the UPDATE statement.
-        # We exclude the identifiers used in the WHERE clause.
         fields_to_set = {
             k: v for k, v in update_data.items() if k not in ["original_name", "sw_id"]
         }
 
-        # If there are no actual fields to SET after filtering, there's nothing to do.
         if not fields_to_set:
             return {"message": "No data fields were provided to update."}
 
         set_clauses = [f"{key} = :{key}" for key in fields_to_set.keys()]
 
-        # 2. Construct the SQL to update all matching records.
+        # --- FIX: Dynamic and UNIQUE WHERE clause for sw_id ---
+        sw_id_clause = (
+            "SW_ID = :sw_id" if node_update.sw_id is not None else "SW_ID IS NULL"
+        )
+
         sql = f"""
             UPDATE nodes 
             SET {', '.join(set_clauses)}
             WHERE NAME = :original_name 
-              AND SW_ID = :sw_id
+              AND {sw_id_clause}
         """
 
-        # 3. Prepare the parameters for the query.
+        # Prepare parameters, ensuring sw_id is included only if it's not None
         params = fields_to_set
         params["original_name"] = node_update.original_name
-        params["sw_id"] = node_update.sw_id
+        if node_update.sw_id is not None:
+            params["sw_id"] = node_update.sw_id
 
         cursor.execute(sql, params)
 
@@ -313,7 +388,7 @@ def update_device(node_update: NodeUpdate):
             conn.rollback()
             raise HTTPException(
                 status_code=404,
-                detail=f"No nodes found with name '{node_update.original_name}' for the specified OLT.",
+                detail=f"No nodes found with name '{node_update.original_name}' for the specified system.",
             )
 
         conn.commit()
@@ -428,32 +503,37 @@ def copy_device(copy_request: NodeCopy):
 @app.delete("/node", status_code=200)
 def delete_node(node_info: NodeDeleteByName):
     """
-    Deletes all records for a node based on its name and the SW_ID of the OLT.
-    This ensures all connections for that specific ONU are removed.
+    Deletes all records for a node based on its name and sw_id (which can be null).
     """
-    sql = "DELETE FROM nodes WHERE NAME = :name_bv AND SW_ID = :sw_id_bv"
+    # --- FIX: Dynamic WHERE clause for sw_id ---
+    sw_id_clause = (
+        "SW_ID = :sw_id_bv" if node_info.sw_id is not None else "SW_ID IS NULL"
+    )
+
+    sql = f"DELETE FROM nodes WHERE NAME = :name_bv AND {sw_id_clause}"
 
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
 
-        params = {"name_bv": node_info.name, "sw_id_bv": node_info.sw_id}
+        # Conditionally build the parameters dictionary
+        params = {"name_bv": node_info.name}
+        if node_info.sw_id is not None:
+            params["sw_id_bv"] = node_info.sw_id
 
         cursor.execute(sql, params)
 
-        # cursor.rowcount will be > 0 if any records were deleted
         if cursor.rowcount == 0:
             conn.rollback()
             raise HTTPException(
                 status_code=404,
-                detail=f"No node with name '{node_info.name}' found for the specified OLT (SW_ID: {node_info.sw_id}).",
+                detail=f"No node with name '{node_info.name}' found for the specified system.",
             )
 
         conn.commit()
-
         return {
-            "message": f"All records for node '{node_info.name}' under OLT {node_info.sw_id} were deleted successfully."
+            "message": f"All records for node '{node_info.name}' were deleted successfully."
         }
 
     except oracledb.Error as e:
@@ -465,42 +545,37 @@ def delete_node(node_info: NodeDeleteByName):
             conn.close()
 
 
+# In main.py, find and replace the entire /edge delete endpoint function
+
+
 @app.delete("/edge", status_code=200)
 def delete_edge(edge_info: EdgeDeleteByName):
     """
-    Disconnects a node from a parent using a PL/SQL block to handle unique constraints.
-    It first deletes any existing orphaned record for the node and then sets the
-    parent_id of the target connection to NULL.
+    Disconnects a node from a parent using a null-safe PL/SQL block.
     """
-    # This PL/SQL block ensures the operations are atomic.
     plsql_block = """
     BEGIN
-        -- Step 1: Delete any pre-existing orphaned record for this device.
-        -- This prevents a unique constraint violation in the next step.
+        -- Step 1: Delete any pre-existing orphan. Null-safe comparison.
         DELETE FROM nodes
         WHERE NAME = :name_bv
-          AND SW_ID = :sw_id_bv
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) -- <-- FIX
           AND PARENT_ID IS NULL;
 
-        -- Step 2: Update the target connection, setting its PARENT_ID to NULL
-        -- and clearing its position to make it a freshly orphaned node.
-        -- MODIFIED: Added position_x and position_y to the SET clause.
+        -- Step 2: Update the target connection to make it an orphan. Null-safe comparison.
         UPDATE nodes
         SET PARENT_ID = NULL,
             position_x = NULL,
             position_y = NULL
         WHERE NAME = :name_bv
           AND PARENT_ID = :source_id_bv
-          AND SW_ID = :sw_id_bv;
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1); -- <-- FIX
 
         -- Check if the update operation actually changed a row.
         IF SQL%ROWCOUNT = 0 THEN
-            -- If no rows were updated, it means the connection didn't exist.
             RAISE_APPLICATION_ERROR(-20001, 'No matching connection found to update.');
         END IF;
 
-        -- Step 3: NEW - Reset positions for all former sibling nodes that are not manually positioned.
-        -- This will cause the front-end layout algorithm to rearrange the remaining group.
+        -- Step 3: Reset positions for former siblings.
         UPDATE nodes
         SET position_x = NULL,
             position_y = NULL
@@ -522,8 +597,7 @@ def delete_edge(edge_info: EdgeDeleteByName):
         }
 
         cursor.execute(plsql_block, params)
-
-        conn.commit()  # Commit the transaction
+        conn.commit()
 
         return {
             "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed."
@@ -531,16 +605,13 @@ def delete_edge(edge_info: EdgeDeleteByName):
 
     except oracledb.DatabaseError as e:
         if conn:
-            conn.rollback()  # Rollback on any database error
+            conn.rollback()
 
         (error,) = e.args
-        # Catch the custom error we raised in the PL/SQL block
         if "No matching connection found" in error.message:
             raise HTTPException(
                 status_code=404, detail="The specified connection record was not found."
             )
-
-        # Handle all other database errors
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     finally:

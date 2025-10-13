@@ -27,19 +27,26 @@ class NodeCopy(BaseModel):
     new_parent_id: int
 
 
+class PositionReset(BaseModel):
+    sw_id: Optional[int] = None
+    scope: Optional[str] = None  # Expected values: "all" or "manual"
+    node_id: Optional[int] = None
+
+
 class EdgeDeleteByName(BaseModel):
     name: str  # The 'name' of the child node (e.g., "EPON0/5:1")
     source_id: int  # The 'id' of the parent node (e.g., the PON's ID)
-    sw_id: int  # The 'id' of the OLT
+    sw_id: Optional[int] = None  # The 'id' of the OLT
 
 
 class NodeDeleteByName(BaseModel):
     name: str
-    sw_id: int
+    sw_id: Optional[int] = None
+
 
 class NodeCreate(BaseModel):
     name: str
-    sw_id: int
+    sw_id: Optional[int] = None
     parent_id: Optional[int] = None
     node_type: Optional[str] = None
     link_type: Optional[str] = None
@@ -62,7 +69,8 @@ class NodeCreate(BaseModel):
     location: Optional[str] = None
     remarks: Optional[str] = None
 
+
 class NodeInsert(BaseModel):
     new_node_data: Dict[str, Any]
     original_source_id: int
-    original_edge_record_id: int # Changed from original_target_id
+    original_edge_record_id: int  # Changed from original_target_id
