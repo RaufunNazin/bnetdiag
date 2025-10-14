@@ -163,19 +163,46 @@ def reset_node_positions(reset_request: PositionReset):
 async def read_general_data():
     """
     Endpoint for the general network view.
-    Calls get_data without an sw_id.
+    Calls get_data without a root_node_id.
     """
-    return get_data(sw_id=None)
+    # --- THIS IS THE FIX ---
+    # The function now expects 'root_node_id', not 'sw_id'.
+    return get_data(root_node_id=None)
 
 
-@app.get("/data/{sw_id}")
-def read_data(sw_id: int):
+@app.get("/data/{root_node_id}")
+def read_data(root_node_id: int):
     """
-    Endpoint to get data from the 'nodes' table using the get_data function from crud.py.
+    Endpoint to get a specific node and all its descendants.
     """
-    return get_data(sw_id=sw_id)
+    return get_data(root_node_id=root_node_id)
 
-    # ADD THIS NEW ENDPOINT
+
+@app.get("/nodes/root-candidates", response_model=List[Dict[str, Any]])
+def get_root_candidates():
+    """
+    Returns a list of nodes that can be used as a root in the general view
+    (Routers and Switches).
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        sql = """
+            SELECT id, name FROM nodes 
+            WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch') 
+            ORDER BY name
+        """
+        cursor.execute(sql)
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        return [dict(zip(columns, row)) for row in rows]
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.post("/node/insert", status_code=201)

@@ -3,11 +3,15 @@ from typing import List, Dict, Any
 import oracledb
 from database import get_connection
 
-def get_data(sw_id: int = None) -> List[Dict[str, Any]]:
+
+# In crud.py
+
+
+def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
     """
     Fetches data from the 'nodes' table.
-    - If sw_id is provided, it fetches all records for that sw_id.
-    - If sw_id is None, it fetches all nodes that do NOT belong to an OLT-based system.
+    - If root_node_id is provided, it fetches that node and all its descendants.
+    - If root_node_id is None, it fetches the general network view.
     """
     conn = None
     try:
@@ -17,17 +21,16 @@ def get_data(sw_id: int = None) -> List[Dict[str, Any]]:
         sql = ""
         params = {}
 
-        if sw_id is not None:
-            # Logic for a specific OLT view (unchanged)
-            sql = "SELECT * FROM nodes WHERE SW_ID = :sw_id_bv OR ID = :sw_id_bv"
-            params["sw_id_bv"] = sw_id
+        if root_node_id is not None:
+            # --- FIX: Use a hierarchical query for specific views ---
+            sql = """
+                SELECT * FROM nodes
+                START WITH id = :root_node_id_bv
+                CONNECT BY PRIOR id = parent_id
+            """
+            params["root_node_id_bv"] = root_node_id
         else:
-            # --- CORRECTED LOGIC FOR THE GENERAL VIEW ---
-            # This query selects nodes where:
-            # 1. sw_id IS NULL
-            # OR
-            # 2. sw_id is NOT IN the list of sw_ids that belong to OLT systems.
-            # The subquery explicitly excludes NULLs to ensure 'NOT IN' works correctly.
+            # Logic for the general network view (unchanged)
             sql = """
                 SELECT * FROM nodes
                 WHERE node_type NOT IN ('PON', 'ONU') AND (parent_id IS NULL OR parent_id NOT IN (
@@ -52,3 +55,4 @@ def get_data(sw_id: int = None) -> List[Dict[str, Any]]:
     finally:
         if conn:
             conn.close()
+    
