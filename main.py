@@ -373,8 +373,11 @@ def get_olts():
 def update_device(node_update: NodeUpdate):
     update_data = node_update.dict(exclude_unset=True)
 
-    # --- FIX: Updated validation ---
-    # We always need original_name to identify the record. sw_id is optional but used for uniqueness.
+    # --- Start of Debugging ---
+    print("\n--- UPDATE DEVICE REQUEST ---")
+    print(f"Received data: {update_data}")
+    # --- End of Debugging ---
+
     if "original_name" not in update_data:
         raise HTTPException(
             status_code=400,
@@ -395,7 +398,6 @@ def update_device(node_update: NodeUpdate):
 
         set_clauses = [f"{key} = :{key}" for key in fields_to_set.keys()]
 
-        # --- FIX: Dynamic and UNIQUE WHERE clause for sw_id ---
         sw_id_clause = (
             "SW_ID = :sw_id" if node_update.sw_id is not None else "SW_ID IS NULL"
         )
@@ -407,13 +409,21 @@ def update_device(node_update: NodeUpdate):
               AND {sw_id_clause}
         """
 
-        # Prepare parameters, ensuring sw_id is included only if it's not None
         params = fields_to_set
         params["original_name"] = node_update.original_name
         if node_update.sw_id is not None:
             params["sw_id"] = node_update.sw_id
 
+        # --- More Debugging ---
+        print(f"Executing SQL: {sql.strip()}")
+        print(f"With parameters: {params}")
+        # --- End of Debugging ---
+
         cursor.execute(sql, params)
+
+        # --- Final Debugging Check ---
+        print(f"Rows affected: {cursor.rowcount}")
+        # --- End of Debugging ---
 
         if cursor.rowcount == 0:
             conn.rollback()
@@ -439,7 +449,7 @@ def update_device(node_update: NodeUpdate):
 @app.post("/device/copy", status_code=201)
 def copy_device(copy_request: NodeCopy):
     """
-    Connects a device to a new parent.
+    Connects a device to a new parent using a null-safe PL/SQL block.
     If an orphaned record for the device exists, it updates it.
     Otherwise, it creates a new record for the connection.
     """
@@ -456,24 +466,24 @@ def copy_device(copy_request: NodeCopy):
           FROM nodes
           WHERE id = :source_node_id;
 
-          -- 2. Check if an orphaned record (parent_id is null) already exists.
+          -- 2. Check for an orphan using a null-safe comparison.
           SELECT COUNT(*)
           INTO v_orphan_count
           FROM nodes
           WHERE name = v_name
-            AND sw_id = v_sw_id
+            AND NVL(sw_id, -1) = NVL(v_sw_id, -1) -- <-- FIX
             AND parent_id IS NULL;
 
           -- 3. Decide whether to UPDATE the orphan or INSERT a new copy.
           IF v_orphan_count > 0 THEN
-            -- An orphan exists, so just update it with the new parent.
+            -- An orphan exists, so update it with the new parent (null-safe).
             UPDATE nodes
             SET parent_id = :new_parent_id,
                 position_x = NULL,
                 position_y = NULL,
                 position_mode = 0
             WHERE name = v_name
-              AND sw_id = v_sw_id
+              AND NVL(sw_id, -1) = NVL(v_sw_id, -1) -- <-- FIX
               AND parent_id IS NULL;
           ELSE
             -- No orphan exists, so create a new copy.
@@ -488,9 +498,7 @@ def copy_device(copy_request: NodeCopy):
             INSERT INTO nodes VALUES node_record;
           END IF;
 
-          -- 4. NEW: Reset positions for all sibling nodes that are not manually positioned.
-          -- This will cause the front-end layout algorithm to rearrange the entire group.
-          -- It only affects nodes where position_mode is not 1 (e.g., 0 or NULL).
+          -- 4. Reset positions for all sibling nodes.
           UPDATE nodes
           SET position_x = NULL,
               position_y = NULL

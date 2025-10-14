@@ -16,6 +16,8 @@ class NodeUpdate(BaseModel):
     brand: Optional[str] = None
     mac: Optional[str] = None
     model: Optional[str] = None
+    lat1: Optional[float] = None
+    long1: Optional[float] = None
     remarks: Optional[str] = None
     position_x: Optional[float] = None
     position_y: Optional[float] = None
