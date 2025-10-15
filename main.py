@@ -228,12 +228,33 @@ def insert_node(insert_data: NodeInsert):
                 :vlan, :lat1, :long1, :remarks, :position_x, :position_y
             ) RETURNING id INTO v_new_node_id;
 
-            -- Step 2: Update the ORIGINAL connection record.
-            -- Instead of connecting to the old target, it now becomes the new node's child.
-            -- We find it by its unique ID.
+            -- Step 2: Update the ORIGINAL connection record to point to the new node.
             UPDATE nodes
             SET parent_id = v_new_node_id
             WHERE id = :original_edge_record_id;
+
+            -- --- THIS IS THE FIX ---
+            -- Step 3: Reset positions for all sibling nodes of the newly inserted node.
+            -- This forces the frontend layout algorithm to rearrange the group.
+            UPDATE nodes
+            SET position_x = NULL,
+                position_y = NULL
+            WHERE
+                (
+                    -- Group (a): Siblings of the newly inserted node
+                    parent_id = :parent_id
+                    OR
+                    -- Group (b): The original child and its entire descendant tree
+                    id IN (
+                        SELECT id FROM nodes
+                        START WITH id = :original_edge_record_id
+                        CONNECT BY PRIOR id = parent_id
+                    )
+                )
+                AND (position_mode IS NULL OR position_mode != 1);
+
+            
+            COMMIT; -- Ensure the transaction is committed
             
         END;
     """
@@ -452,6 +473,7 @@ def copy_device(copy_request: NodeCopy):
     Connects a device to a new parent using a null-safe PL/SQL block.
     If an orphaned record for the device exists, it updates it.
     Otherwise, it creates a new record for the connection.
+    Also resets positions for the new sibling group, ignoring manually placed nodes.
     """
     plsql_block = """
         DECLARE
@@ -471,7 +493,7 @@ def copy_device(copy_request: NodeCopy):
           INTO v_orphan_count
           FROM nodes
           WHERE name = v_name
-            AND NVL(sw_id, -1) = NVL(v_sw_id, -1) -- <-- FIX
+            AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
             AND parent_id IS NULL;
 
           -- 3. Decide whether to UPDATE the orphan or INSERT a new copy.
@@ -483,7 +505,7 @@ def copy_device(copy_request: NodeCopy):
                 position_y = NULL,
                 position_mode = 0
             WHERE name = v_name
-              AND NVL(sw_id, -1) = NVL(v_sw_id, -1) -- <-- FIX
+              AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
               AND parent_id IS NULL;
           ELSE
             -- No orphan exists, so create a new copy.
@@ -498,12 +520,18 @@ def copy_device(copy_request: NodeCopy):
             INSERT INTO nodes VALUES node_record;
           END IF;
 
-          -- 4. Reset positions for all sibling nodes.
+          -- --- THIS IS THE FIX ---
+          -- 4. Reset positions for all sibling nodes of the new connection,
+          --    ignoring any nodes that were manually positioned.
           UPDATE nodes
           SET position_x = NULL,
               position_y = NULL
-          WHERE parent_id = :new_parent_id
-            AND (position_mode != 1 OR position_mode IS NULL);
+          WHERE id IN (
+              SELECT id FROM nodes
+              START WITH parent_id = :new_parent_id
+              CONNECT BY PRIOR id = parent_id
+            )
+            AND (position_mode IS NULL OR position_mode != 1);
 
           COMMIT;
         END;
@@ -542,43 +570,89 @@ def copy_device(copy_request: NodeCopy):
 @app.delete("/node", status_code=200)
 def delete_node(node_info: NodeDeleteByName):
     """
-    Deletes all records for a node based on its name and sw_id (which can be null).
+    Deletes a node. Before deleting, it re-parents any children to the
+    deleted node's parent. It then triggers a CASCADING position reset
+    for the entire affected branch, starting from the grandparent.
     """
-    # --- FIX: Dynamic WHERE clause for sw_id ---
-    sw_id_clause = (
-        "SW_ID = :sw_id_bv" if node_info.sw_id is not None else "SW_ID IS NULL"
-    )
+    plsql_block = """
+    DECLARE
+        v_rows_deleted NUMBER := 0;
+    BEGIN
+        -- Step 1: For every instance of the node we are deleting...
+        FOR node_to_delete IN (
+            SELECT id, parent_id
+            FROM nodes
+            WHERE NAME = :name_bv
+              AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
+        )
+        LOOP
+            -- Step 2: Re-parent its immediate children to its parent (the "grandparent").
+            -- This patches the chain (e.g., 1-2-3 becomes 1-3).
+            UPDATE nodes
+            SET parent_id = node_to_delete.parent_id
+            WHERE parent_id = node_to_delete.id;
 
-    sql = f"DELETE FROM nodes WHERE NAME = :name_bv AND {sw_id_clause}"
+            -- --- THIS IS THE FIX ---
+            -- Step 3: If there was a grandparent, trigger a cascading position reset
+            -- for that grandparent and its entire descendant tree.
+            IF node_to_delete.parent_id IS NOT NULL THEN
+                UPDATE nodes
+                SET position_x = NULL,
+                    position_y = NULL
+                WHERE id IN (
+                    -- Find the grandparent itself and all of its descendants
+                    SELECT id FROM nodes
+                    START WITH id = node_to_delete.parent_id
+                    CONNECT BY PRIOR id = parent_id
+                )
+                -- Only reset nodes that were not manually positioned.
+                AND (position_mode IS NULL OR position_mode != 1);
+            END IF;
+
+        END LOOP;
+
+        -- Step 4: After processing all instances, delete the target node.
+        DELETE FROM nodes
+        WHERE NAME = :name_bv
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
+
+        -- Step 5: Check if the delete operation actually removed rows.
+        v_rows_deleted := SQL%ROWCOUNT;
+        IF v_rows_deleted = 0 THEN
+            RAISE_APPLICATION_ERROR(-20002, 'No node found to delete.');
+        END IF;
+
+        COMMIT;
+    END;
+    """
 
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Conditionally build the parameters dictionary
-        params = {"name_bv": node_info.name}
-        if node_info.sw_id is not None:
-            params["sw_id_bv"] = node_info.sw_id
+        params = {
+            "name_bv": node_info.name,
+            "sw_id_bv": node_info.sw_id,
+        }
 
-        cursor.execute(sql, params)
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            raise HTTPException(
-                status_code=404,
-                detail=f"No node with name '{node_info.name}' found for the specified system.",
-            )
-
+        cursor.execute(plsql_block, params)
         conn.commit()
+
         return {
             "message": f"All records for node '{node_info.name}' were deleted successfully."
         }
 
-    except oracledb.Error as e:
+    except oracledb.DatabaseError as e:
         if conn:
             conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        (error,) = e.args
+        if "No node found to delete" in error.message:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No node with name '{node_info.name}' found for the specified system.",
+            )
+        raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
     finally:
         if conn:
             conn.close()
@@ -594,27 +668,39 @@ def delete_edge(edge_info: EdgeDeleteByName):
     """
     plsql_block = """
     BEGIN
-        -- Step 1: Delete any pre-existing orphan. Null-safe comparison.
+        -- Step 1: Delete any pre-existing orphan to prevent conflicts.
         DELETE FROM nodes
         WHERE NAME = :name_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) -- <-- FIX
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
           AND PARENT_ID IS NULL;
 
-        -- Step 2: Update the target connection to make it an orphan. Null-safe comparison.
+        -- Step 2: Make the target node an orphan by setting its PARENT_ID to NULL.
+        -- We no longer reset the position here; we do it in the next step.
         UPDATE nodes
-        SET PARENT_ID = NULL,
-            position_x = NULL,
-            position_y = NULL
+        SET PARENT_ID = NULL
         WHERE NAME = :name_bv
           AND PARENT_ID = :source_id_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1); -- <-- FIX
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
 
         -- Check if the update operation actually changed a row.
         IF SQL%ROWCOUNT = 0 THEN
             RAISE_APPLICATION_ERROR(-20001, 'No matching connection found to update.');
         END IF;
 
-        -- Step 3: Reset positions for former siblings.
+        -- --- THIS IS THE FIX ---
+        -- Step 3: Perform a CASCADING position reset on the newly created orphan tree.
+        UPDATE nodes
+        SET position_x = NULL,
+            position_y = NULL
+        WHERE id IN (
+            -- Find the new orphan root and ALL of its descendants
+            SELECT id FROM nodes
+            START WITH NAME = :name_bv AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) AND PARENT_ID IS NULL
+            CONNECT BY PRIOR id = parent_id
+        )
+        AND (position_mode IS NULL OR position_mode != 1);
+
+        -- Step 4: Reset positions for the former siblings that remained connected.
         UPDATE nodes
         SET position_x = NULL,
             position_y = NULL

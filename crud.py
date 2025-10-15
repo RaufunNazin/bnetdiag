@@ -24,9 +24,24 @@ def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
         if root_node_id is not None:
             # --- FIX: Use a hierarchical query for specific views ---
             sql = """
+                -- Query 1: Get the main node and all of its descendants (no change here)
                 SELECT * FROM nodes
                 START WITH id = :root_node_id_bv
                 CONNECT BY PRIOR id = parent_id
+    
+                UNION
+
+                -- Query 2: Get all nodes that BELONG to an orphan tree in the same system
+                SELECT * FROM nodes
+                WHERE id IN (
+                    -- This subquery finds the IDs of all nodes in every orphan tree
+                    SELECT id FROM nodes
+                    -- START WITH finds the top of each orphan chain in the correct system
+                    START WITH parent_id IS NULL
+                        AND sw_id = :root_node_id_bv
+                    -- CONNECT BY travels down each of those chains to get all descendants
+                    CONNECT BY PRIOR id = parent_id
+                )
             """
             params["root_node_id_bv"] = root_node_id
         else:
@@ -36,7 +51,7 @@ def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
                 WHERE node_type NOT IN ('PON', 'ONU') AND (parent_id IS NULL OR parent_id NOT IN (
                     SELECT id FROM nodes
                     WHERE node_type IN ('OLT', 'PON', 'ONU') AND sw_id IS NOT NULL
-                ))
+                )) AND sw_id IS NULL
             """
 
         cursor.execute(sql, params)
@@ -55,4 +70,3 @@ def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
     finally:
         if conn:
             conn.close()
-    
