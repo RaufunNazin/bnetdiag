@@ -19,7 +19,7 @@ from models import (
 # Create the FastAPI application instance
 app = FastAPI(title="netdiag-backend", version="1.0.0")
 
-allowed_hosts = ["http://localhost:5173", "https://netdiag.vercel.app"]
+allowed_hosts = ["http://localhost:5173"]
 
 # 2. REMOVE your old @app.middleware("http") function completely.
 
