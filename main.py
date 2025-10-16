@@ -13,12 +13,13 @@ from models import (
     NodeCreate,
     NodeInsert,
     PositionReset,
+    OnuCustomerInfo,
 )
 
 # Create the FastAPI application instance
 app = FastAPI(title="netdiag-backend", version="1.0.0")
 
-allowed_hosts = ["http://localhost:5173"]
+allowed_hosts = ["http://localhost:5173", "https://netdiag.vercel.app/"]
 
 # 2. REMOVE your old @app.middleware("http") function completely.
 
@@ -89,6 +90,47 @@ def test_oracle_connection():
         if conn:
             conn.close()
             print("Connection closed.")
+
+
+# Add this new function anywhere in main.py
+@app.get("/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo])
+def get_onu_customer_details(olt_id: int, port_name: str):
+    """
+    Fetches customer details for a specific ONU port on a given OLT.
+    """
+    sql = """
+        SELECT port, portno, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
+               expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
+               nvl(class_id,-1) cls, is_online3 (h.user_id) online1, GET_USER_STATUS(h.user_id) st2,
+               sysdate-m.udate diff
+        FROM OLT_CUSTOMER_MAC_2 m, switch_snmp_onu_ports p, home_conn h
+        WHERE h.user_id=m.user_id
+          AND p.ifdescr=m.port
+          AND m.olt_id=p.sw_id
+          AND m.olt_id = :olt_id_bv
+          AND m.port = :port_name_bv
+        ORDER BY m.port, portno
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
+        cursor.execute(sql, params)
+
+        # Map results to a list of dictionaries
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        results = [dict(zip(columns, row)) for row in rows]
+        return results
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 # Add this new endpoint function anywhere inside main.py
