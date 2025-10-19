@@ -1,6 +1,8 @@
 # main.py
 from typing import Any, Dict, List
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm  # <-- Add this
+from datetime import timedelta  # <-- Add this
 import oracledb
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_connection
@@ -14,6 +16,16 @@ from models import (
     NodeInsert,
     PositionReset,
     OnuCustomerInfo,
+)
+from auth import (
+    Token,
+    User,
+    get_user_password_from_db,
+    pwd_context,
+    get_user_from_db,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    create_access_token,
+    get_current_user,  # <-- You will need this for other endpoints
 )
 
 # Create the FastAPI application instance
@@ -38,83 +50,106 @@ def read_root():
     """
     A simple root endpoint to confirm the API is running.
     """
-    return {"message": "FastAPI is running. Visit /test-oracle to query the database."}
+    return {"message": "FastAPI is running. Visit /token to login."}
 
 
-@app.get("/test-oracle")
-def test_oracle_connection():
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     """
-    Gets a connection from the database module, executes a simple query,
-    and returns the result.
+    Login endpoint to verify username/password and issue a JWT.
     """
-    conn = None  # Initialize connection to None
-    try:
-        # Get a connection using the new function
-        conn = get_connection()
-        print("✅ Connection successful!")
+    # 1. Get the password from DB (in plaintext, as per your setup)
+    hashed_password = get_user_password_from_db(form_data.username)
 
-        # Create a cursor to execute SQL commands
-        cursor = conn.cursor()
-
-        # Define and execute the query
-        sql = "SELECT user, sysdate FROM dual"
-        print(f"Executing query: {sql}")
-        cursor.execute(sql)
-
-        # Fetch the result
-        result = cursor.fetchone()
-        cursor.close()
-
-        if result:
-            db_user, db_date = result
-            return {
-                "status": "success",
-                "database_user": "db_user",
-                "database_time": db_date.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        else:
-            raise HTTPException(status_code=404, detail="Query returned no results.")
-
-    except oracledb.Error as e:
-        # Handle any database-related errors
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
-    except Exception as e:
-        # Handle other unexpected errors
+    # 2. Verify the password
+    # ⚠️ This uses PlainTextContext. See auth.py security note.
+    if not hashed_password or not pwd_context.verify(
+        form_data.password, hashed_password
+    ):
         raise HTTPException(
-            status_code=500, detail=f"An unexpected error occurred: {e}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    finally:
-        # VERY IMPORTANT: Ensure the connection is always closed
-        if conn:
-            conn.close()
-            print("Connection closed.")
+    # 3. Fetch the full user details to embed in the token
+    user = get_user_from_db(form_data.username)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not find user after login.",
+        )
+
+    # 4. Create the JWT
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "role_id": user.role_id,
+            "area_id": user.area_id,
+            "first_name": user.first_name,
+        },
+        expires_delta=access_token_expires,
+    )
+
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # Add this new function anywhere in main.py
-@app.get("/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo])
-def get_onu_customer_details(olt_id: int, port_name: str):
+@app.get(
+    "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
+)
+def get_onu_customer_details(
+    olt_id: int, port_name: str, current_user: User = Depends(get_current_user)
+):
     """
     Fetches customer details for a specific ONU port on a given OLT.
+    Includes authorization check to ensure reseller owns the OLT.
     """
-    sql = """
-        SELECT port, portno, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
-               expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
-               nvl(class_id,-1) cls, is_online3 (h.user_id) online1, GET_USER_STATUS(h.user_id) st2,
-               sysdate-m.udate diff
-        FROM OLT_CUSTOMER_MAC_2 m, switch_snmp_onu_ports p, home_conn h
-        WHERE h.user_id=m.user_id
-          AND p.ifdescr=m.port
-          AND m.olt_id=p.sw_id
-          AND m.olt_id = :olt_id_bv
-          AND m.port = :port_name_bv
-        ORDER BY m.port, portno
-    """
+
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
+
+        # --- UNIFIED AUTHORIZATION CHECK ---
+        if current_user.role_id in [2, 3]:
+            # User must have an assigned area to proceed
+            if current_user.area_id is None:
+                raise HTTPException(
+                    status_code=403, detail="Your account is not assigned to an area."
+                )
+
+            cursor.execute(
+                "SELECT area_id FROM switches WHERE id = :olt_id_bv",
+                {"olt_id_bv": olt_id},
+            )
+            row = cursor.fetchone()
+
+            if not row or row[0] != current_user.area_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Permission denied: You do not own this OLT.",
+                )
+        else:
+            # Deny any other role
+            raise HTTPException(status_code=403, detail="Not authorized.")
+
+        # --- Main Query (proceeds if user is admin or passed the check) ---
+        sql = """
+            SELECT port, portno, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
+                   expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
+                   nvl(class_id,-1) cls, is_online3 (h.user_id) online1, GET_USER_STATUS(h.user_id) st2,
+                   sysdate-m.udate diff
+            FROM OLT_CUSTOMER_MAC_2 m, switch_snmp_onu_ports p, home_conn h
+            WHERE h.user_id=m.user_id
+              AND p.ifdescr=m.port
+              AND m.olt_id=p.sw_id
+              AND m.olt_id = :olt_id_bv
+              AND m.port = :port_name_bv
+            ORDER BY m.port, portno
+        """
 
         params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
         cursor.execute(sql, params)
@@ -135,7 +170,9 @@ def get_onu_customer_details(olt_id: int, port_name: str):
 
 # Add this new endpoint function anywhere inside main.py
 @app.post("/positions/reset", status_code=200)
-def reset_node_positions(reset_request: PositionReset):
+def reset_node_positions(
+    reset_request: PositionReset, current_user: User = Depends(get_current_user)
+):
     """
     Resets node positions based on the provided scope. Now correctly scopes the general view.
     """
@@ -147,6 +184,17 @@ def reset_node_positions(reset_request: PositionReset):
     """
     where_clauses = []
     params = {}
+
+    # --- Authorization ---
+    if current_user.role_id not in [2, 3]:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    if current_user.area_id is None:
+        raise HTTPException(
+            status_code=403, detail="Your account is not assigned to an area."
+        )
+
+    where_clauses.append("area_id = :area_id")
+    params["area_id"] = current_user.area_id
 
     if reset_request.node_id:
         where_clauses.append("id = :node_id")
@@ -202,40 +250,59 @@ def reset_node_positions(reset_request: PositionReset):
 
 
 @app.get("/data", response_model=List[Dict[str, Any]])
-async def read_general_data():
+async def read_general_data(current_user: User = Depends(get_current_user)):
     """
     Endpoint for the general network view.
     Calls get_data without a root_node_id.
     """
     # --- THIS IS THE FIX ---
     # The function now expects 'root_node_id', not 'sw_id'.
-    return get_data(root_node_id=None)
+    return get_data(root_node_id=None, current_user=current_user)
 
 
 @app.get("/data/{root_node_id}")
-def read_data(root_node_id: int):
+def read_data(root_node_id: int, current_user: User = Depends(get_current_user)):
     """
     Endpoint to get a specific node and all its descendants.
     """
-    return get_data(root_node_id=root_node_id)
+    return get_data(root_node_id=root_node_id, current_user=current_user)
 
 
 @app.get("/nodes/root-candidates", response_model=List[Dict[str, Any]])
-def get_root_candidates():
+def get_root_candidates(current_user: User = Depends(get_current_user)):
     """
     Returns a list of nodes that can be used as a root in the general view
     (Routers and Switches).
     """
+    # --- UNIFIED AUTHORIZATION ---
+    if current_user.role_id not in [2, 3]:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    if current_user.area_id is None:
+        raise HTTPException(
+            status_code=403, detail="Your account is not assigned to an area."
+        )
+
+    sql += " AND area_id = :area_id ORDER BY name"
+    params["area_id"] = current_user.area_id
+
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
         sql = """
             SELECT id, name FROM nodes 
-            WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch') 
-            ORDER BY name
+            WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch')
         """
-        cursor.execute(sql)
+        params = {}
+
+        # --- Authorization ---
+        if current_user.role_id == 3:
+            sql += " AND area_id = :area_id"
+            params["area_id"] = current_user.area_id
+
+        sql += " ORDER BY name"
+
+        cursor.execute(sql, params)
         columns = [desc[0].lower() for desc in cursor.description]
         rows = cursor.fetchall()
         cursor.close()
@@ -248,7 +315,9 @@ def get_root_candidates():
 
 
 @app.post("/node/insert", status_code=201)
-def insert_node(insert_data: NodeInsert):
+def insert_node(
+    insert_data: NodeInsert, current_user: User = Depends(get_current_user)
+):
     """
     Inserts a new node into an existing connection by updating the original
     connection record to point to the new node.
@@ -256,48 +325,56 @@ def insert_node(insert_data: NodeInsert):
     plsql_block = """
         DECLARE
             v_new_node_id nodes.id%TYPE;
+            v_area_id     nodes.area_id%TYPE;
         BEGIN
-            -- Step 1: Insert the new node. Its parent is the original source.
-            INSERT INTO nodes (
-                id, name, node_type, parent_id, sw_id, link_type, brand, model, 
-                serial_no, mac, ip, split_ratio, split_group, cable_id, 
-                cable_start, cable_end, cable_length, cable_color, cable_desc, 
-                vlan, lat1, long1, remarks, position_x, position_y
-            ) VALUES (
-                nodes_sq.NEXTVAL, :name, :node_type, :parent_id, :sw_id, :link_type, :brand, :model,
-                :serial_no, :mac, :ip, :split_ratio, :split_group, :cable_id,
-                :cable_start, :cable_end, :cable_length, :cable_color, :cable_desc,
-                :vlan, :lat1, :long1, :remarks, :position_x, :position_y
-            ) RETURNING id INTO v_new_node_id;
+            -- Step 1: Check permissions by getting area_id of the parent
+            SELECT area_id INTO v_area_id
+            FROM nodes
+            WHERE id = :original_source_id;
 
-            -- Step 2: Update the ORIGINAL connection record to point to the new node.
-            UPDATE nodes
-            SET parent_id = v_new_node_id
-            WHERE id = :original_edge_record_id;
+            -- Step 2: Enforce authorization
+            IF (v_parent_area_id = :area_id) THEN
+                -- Step 3: Insert the new node, inheriting the parent's area_id
+                INSERT INTO nodes (
+                    id, name, node_type, parent_id, sw_id, link_type, brand, model, 
+                    serial_no, mac, ip, split_ratio, split_group, cable_id, 
+                    cable_start, cable_end, cable_length, cable_color, cable_desc, 
+                    vlan, lat1, long1, remarks, position_x, position_y,
+                    area_id -- <-- Add area_id
+                ) VALUES (
+                    nodes_sq.NEXTVAL, :name, :node_type, :parent_id, :sw_id, :link_type, :brand, :model,
+                    :serial_no, :mac, :ip, :split_ratio, :split_group, :cable_id,
+                    :cable_start, :cable_end, :cable_length, :cable_color, :cable_desc,
+                    :vlan, :lat1, :long1, :remarks, :position_x, :position_y,
+                    v_area_id -- <-- Use parent's area_id
+                ) RETURNING id INTO v_new_node_id;
 
-            -- --- THIS IS THE FIX ---
-            -- Step 3: Reset positions for all sibling nodes of the newly inserted node.
-            -- This forces the frontend layout algorithm to rearrange the group.
-            UPDATE nodes
-            SET position_x = NULL,
-                position_y = NULL
-            WHERE
-                (
-                    -- Group (a): Siblings of the newly inserted node
-                    parent_id = :parent_id
-                    OR
-                    -- Group (b): The original child and its entire descendant tree
-                    id IN (
-                        SELECT id FROM nodes
-                        START WITH id = :original_edge_record_id
-                        CONNECT BY PRIOR id = parent_id
+                -- Step 4: Update the ORIGINAL connection record
+                UPDATE nodes
+                SET parent_id = v_new_node_id
+                WHERE id = :original_edge_record_id;
+
+                -- Step 5: Reset positions (your existing logic)
+                UPDATE nodes
+                SET position_x = NULL,
+                    position_y = NULL
+                WHERE
+                    (
+                        parent_id = :parent_id
+                        OR
+                        id IN (
+                            SELECT id FROM nodes
+                            START WITH id = :original_edge_record_id
+                            CONNECT BY PRIOR id = parent_id
+                        )
                     )
-                )
-                AND (position_mode IS NULL OR position_mode != 1);
-
+                    AND (position_mode IS NULL OR position_mode != 1);
+                
+                COMMIT;
             
-            COMMIT; -- Ensure the transaction is committed
-            
+            ELSE
+                RAISE_APPLICATION_ERROR(-20001, 'Permission denied.');
+            END IF;
         END;
     """
     conn = None
@@ -337,6 +414,8 @@ def insert_node(insert_data: NodeInsert):
         for key in all_node_keys:
             params.setdefault(key, None)
 
+        params["role_id"] = current_user.role_id
+        params["area_id"] = current_user.area_id
         params["parent_id"] = insert_data.original_source_id
         params["original_edge_record_id"] = (
             insert_data.original_edge_record_id
@@ -350,6 +429,10 @@ def insert_node(insert_data: NodeInsert):
     except oracledb.DatabaseError as e:
         if conn:
             conn.rollback()
+        if "Permission denied" in str(e):
+            raise HTTPException(
+                status_code=403, detail="Permission denied to modify this component."
+            )
         raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
     finally:
         if conn:
@@ -357,7 +440,7 @@ def insert_node(insert_data: NodeInsert):
 
 
 @app.post("/device", status_code=201)
-def create_node(node: NodeCreate):
+def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)):
     """
     Creates a new node in the database.
     """
@@ -368,9 +451,28 @@ def create_node(node: NodeCreate):
     if "device" in node_data:
         node_data["node_type"] = node_data.pop("device")
 
+    # --- Simplified Authorization Logic ---
+    if current_user.role_id not in [2, 3]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to create components."
+        )
+
+    if current_user.area_id is None:
+        raise HTTPException(
+            status_code=403, detail="Your account is not assigned to an area."
+        )
+
+    # Force the new node to be created in the user's assigned area.
+    node_data["area_id"] = current_user.area_id
+
     # Prepare SQL statement by dynamically getting columns and bind variables
     columns = node_data.keys()
     bind_vars = [f":{col}" for col in columns]
+
+    # --- Make sure 'area_id' is included in the INSERT
+    if "area_id" not in columns:
+        columns.append("area_id")
+        bind_vars.append(":area_id")
 
     sql = f"""
         INSERT INTO nodes (id, {', '.join(columns)}) 
@@ -403,15 +505,25 @@ def create_node(node: NodeCreate):
 
 
 @app.get("/olts")
-def get_olts():
+def get_olts(current_user: User = Depends(get_current_user)):
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-
         # Query to get all switches of type 'OLT'
         sql = "SELECT id, name, olt_type, ip FROM switches WHERE SW_TYPE = 'OLT'"
-        cursor.execute(sql)
+        params = {}
+
+        if current_user.role_id not in [2, 3]:
+            raise HTTPException(status_code=403, detail="Not authorized.")
+        if current_user.area_id is None:
+            raise HTTPException(
+                status_code=403, detail="Your account is not assigned to an area."
+            )
+
+        sql += " AND area_id = :area_id"
+        params["area_id"] = current_user.area_id
+        cursor.execute(sql, params)
 
         # Fetch all results and column names
         rows = cursor.fetchall()
@@ -433,7 +545,9 @@ def get_olts():
 
 
 @app.put("/device", status_code=200)
-def update_device(node_update: NodeUpdate):
+def update_device(
+    node_update: NodeUpdate, current_user: User = Depends(get_current_user)
+):
     update_data = node_update.dict(exclude_unset=True)
 
     # --- Start of Debugging ---
@@ -453,7 +567,9 @@ def update_device(node_update: NodeUpdate):
         cursor = conn.cursor()
 
         fields_to_set = {
-            k: v for k, v in update_data.items() if k not in ["original_name", "sw_id"]
+            k: v
+            for k, v in update_data.items()
+            if k not in ["original_name", "sw_id", "area_id"]
         }
 
         if not fields_to_set:
@@ -461,18 +577,38 @@ def update_device(node_update: NodeUpdate):
 
         set_clauses = [f"{key} = :{key}" for key in fields_to_set.keys()]
 
+        if current_user.role_id == 3 and "area_id" in fields_to_set:
+            del fields_to_set["area_id"]  # Prevent reseller from changing area
+
         sw_id_clause = (
             "SW_ID = :sw_id" if node_update.sw_id is not None else "SW_ID IS NULL"
         )
+
+        auth_clause = ""
+        params = fields_to_set
+        params["original_name"] = node_update.original_name
+
+        if current_user.role_id not in [2, 3]:
+            raise HTTPException(status_code=403, detail="Not authorized.")
+        if current_user.area_id is None:
+            raise HTTPException(
+                status_code=403, detail="Your account is not assigned to an area."
+            )
+
+        auth_clause = " AND area_id = :area_id"
+        params["area_id"] = current_user.area_id
+
+        if node_update.sw_id is not None:
+            params["sw_id"] = node_update.sw_id
 
         sql = f"""
             UPDATE nodes 
             SET {', '.join(set_clauses)}
             WHERE NAME = :original_name 
-              AND {sw_id_clause}
+            AND {sw_id_clause}
+            {auth_clause} 
         """
 
-        params = fields_to_set
         params["original_name"] = node_update.original_name
         if node_update.sw_id is not None:
             params["sw_id"] = node_update.sw_id
@@ -510,7 +646,7 @@ def update_device(node_update: NodeUpdate):
 
 
 @app.post("/device/copy", status_code=201)
-def copy_device(copy_request: NodeCopy):
+def copy_device(copy_request: NodeCopy, current_user: User = Depends(get_current_user)):
     """
     Connects a device to a new parent using a null-safe PL/SQL block.
     If an orphaned record for the device exists, it updates it.
@@ -523,59 +659,75 @@ def copy_device(copy_request: NodeCopy):
           v_name         nodes.name%TYPE;
           v_sw_id        nodes.sw_id%TYPE;
           node_record    nodes%ROWTYPE;
+          v_source_area_id nodes.area_id%TYPE;
+          v_parent_area_id nodes.area_id%TYPE;
         BEGIN
-          -- 1. Find the name and sw_id of the source device to identify its group.
-          SELECT name, sw_id
-          INTO v_name, v_sw_id
-          FROM nodes
-          WHERE id = :source_node_id;
+          -- 1. Get Area IDs for permission check
+          SELECT area_id INTO v_source_area_id
+          FROM nodes WHERE id = :source_node_id;
+          
+          SELECT area_id INTO v_parent_area_id
+          FROM nodes WHERE id = :new_parent_id;
 
-          -- 2. Check for an orphan using a null-safe comparison.
-          SELECT COUNT(*)
-          INTO v_orphan_count
-          FROM nodes
-          WHERE name = v_name
-            AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
-            AND parent_id IS NULL;
-
-          -- 3. Decide whether to UPDATE the orphan or INSERT a new copy.
-          IF v_orphan_count > 0 THEN
-            -- An orphan exists, so update it with the new parent (null-safe).
-            UPDATE nodes
-            SET parent_id = :new_parent_id,
-                position_x = NULL,
-                position_y = NULL,
-                position_mode = 0
-            WHERE name = v_name
-              AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
-              AND parent_id IS NULL;
-          ELSE
-            -- No orphan exists, so create a new copy.
-            SELECT *
-            INTO node_record
+          -- 2. Enforce Authorization
+          IF (v_source_area_id = :area_id AND v_parent_area_id = :area_id) THEN
+          
+            -- 3. Find the name and sw_id of the source device
+            SELECT name, sw_id
+            INTO v_name, v_sw_id
             FROM nodes
             WHERE id = :source_node_id;
 
-            node_record.id := nodes_sq.NEXTVAL;
-            node_record.parent_id := :new_parent_id;
+            -- 4. Check for an orphan
+            SELECT COUNT(*)
+            INTO v_orphan_count
+            FROM nodes
+            WHERE name = v_name
+              AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
+              AND parent_id IS NULL;
 
-            INSERT INTO nodes VALUES node_record;
+            -- 5. Decide whether to UPDATE or INSERT
+            IF v_orphan_count > 0 THEN
+              -- Update orphan
+              UPDATE nodes
+              SET parent_id = :new_parent_id,
+                  position_x = NULL,
+                  position_y = NULL,
+                  position_mode = 0,
+                  area_id = v_parent_area_id -- <-- Inherit new parent's area
+              WHERE name = v_name
+                AND NVL(sw_id, -1) = NVL(v_sw_id, -1)
+                AND parent_id IS NULL;
+            ELSE
+              -- Create new copy
+              SELECT *
+              INTO node_record
+              FROM nodes
+              WHERE id = :source_node_id;
+
+              node_record.id := nodes_sq.NEXTVAL;
+              node_record.parent_id := :new_parent_id;
+              node_record.area_id := v_parent_area_id; -- <-- Inherit new parent's area
+
+              INSERT INTO nodes VALUES node_record;
+            END IF;
+
+            -- 6. Reset positions (your existing logic)
+            UPDATE nodes
+            SET position_x = NULL,
+                position_y = NULL
+            WHERE id IN (
+                SELECT id FROM nodes
+                START WITH parent_id = :new_parent_id
+                CONNECT BY PRIOR id = parent_id
+              )
+              AND (position_mode IS NULL OR position_mode != 1);
+
+            COMMIT;
+            
+          ELSE
+            RAISE_APPLICATION_ERROR(-20001, 'Permission denied. Both components must be in your area.');
           END IF;
-
-          -- --- THIS IS THE FIX ---
-          -- 4. Reset positions for all sibling nodes of the new connection,
-          --    ignoring any nodes that were manually positioned.
-          UPDATE nodes
-          SET position_x = NULL,
-              position_y = NULL
-          WHERE id IN (
-              SELECT id FROM nodes
-              START WITH parent_id = :new_parent_id
-              CONNECT BY PRIOR id = parent_id
-            )
-            AND (position_mode IS NULL OR position_mode != 1);
-
-          COMMIT;
         END;
     """
 
@@ -587,6 +739,8 @@ def copy_device(copy_request: NodeCopy):
         params = {
             "source_node_id": copy_request.source_node_id,
             "new_parent_id": copy_request.new_parent_id,
+            "role_id": current_user.role_id,
+            "area_id": current_user.area_id,
         }
 
         cursor.execute(plsql_block, params)
@@ -598,6 +752,11 @@ def copy_device(copy_request: NodeCopy):
 
     except oracledb.DatabaseError as e:
         (error,) = e.args
+        if "Permission denied" in str(e):
+            raise HTTPException(
+                status_code=403,
+                detail="Permission denied. Both components must be in your area.",
+            )
         if error.code == 1403:
             raise HTTPException(
                 status_code=404,
@@ -610,7 +769,9 @@ def copy_device(copy_request: NodeCopy):
 
 
 @app.delete("/node", status_code=200)
-def delete_node(node_info: NodeDeleteByName):
+def delete_node(
+    node_info: NodeDeleteByName, current_user: User = Depends(get_current_user)
+):
     """
     Deletes a node. Before deleting, it re-parents any children to the
     deleted node's parent. It then triggers a CASCADING position reset
@@ -626,6 +787,7 @@ def delete_node(node_info: NodeDeleteByName):
             FROM nodes
             WHERE NAME = :name_bv
               AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
+              AND (area_id = :area_id)
         )
         LOOP
             -- Step 2: Re-parent its immediate children to its parent (the "grandparent").
@@ -656,7 +818,8 @@ def delete_node(node_info: NodeDeleteByName):
         -- Step 4: After processing all instances, delete the target node.
         DELETE FROM nodes
         WHERE NAME = :name_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
+          AND (area_id = :area_id);
 
         -- Step 5: Check if the delete operation actually removed rows.
         v_rows_deleted := SQL%ROWCOUNT;
@@ -676,6 +839,8 @@ def delete_node(node_info: NodeDeleteByName):
         params = {
             "name_bv": node_info.name,
             "sw_id_bv": node_info.sw_id,
+            "role_id": current_user.role_id,
+            "area_id": current_user.area_id,
         }
 
         cursor.execute(plsql_block, params)
@@ -704,51 +869,75 @@ def delete_node(node_info: NodeDeleteByName):
 
 
 @app.delete("/edge", status_code=200)
-def delete_edge(edge_info: EdgeDeleteByName):
+def delete_edge(
+    edge_info: EdgeDeleteByName, current_user: User = Depends(get_current_user)
+):
     """
-    Disconnects a node from a parent using a null-safe PL/SQL block.
+    Disconnects a node from its parent by setting its parent_id to NULL.
+    - Admins can disconnect any node.
+    - Resellers can only disconnect nodes within their own area_id.
     """
+    # This PL/SQL block now includes the authorization check.
+    # The operation is atomic: if the user lacks permission, no changes are made.
     plsql_block = """
+    DECLARE
+        v_child_area_id nodes.area_id%TYPE;
     BEGIN
-        -- Step 1: Delete any pre-existing orphan to prevent conflicts.
-        DELETE FROM nodes
-        WHERE NAME = :name_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
-          AND PARENT_ID IS NULL;
-
-        -- Step 2: Make the target node an orphan by setting its PARENT_ID to NULL.
-        -- We no longer reset the position here; we do it in the next step.
-        UPDATE nodes
-        SET PARENT_ID = NULL
+        -- Step 1: Find the area_id of the specific node being disconnected to check permissions.
+        -- We must find the exact record representing the connection to be broken.
+        SELECT area_id INTO v_child_area_id
+        FROM nodes
         WHERE NAME = :name_bv
           AND PARENT_ID = :source_id_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
+          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
+        FETCH FIRST 1 ROWS ONLY; -- Ensures we only get one row
 
-        -- Check if the update operation actually changed a row.
-        IF SQL%ROWCOUNT = 0 THEN
-            RAISE_APPLICATION_ERROR(-20001, 'No matching connection found to update.');
+        -- Step 2: Enforce Authorization.
+        -- The operation proceeds only if the user is an admin OR the component's area matches the reseller's area.
+        IF (v_child_area_id = :area_id) THEN
+
+            -- Step 3: Delete any pre-existing orphan to prevent conflicts.
+            DELETE FROM nodes
+            WHERE NAME = :name_bv
+              AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
+              AND PARENT_ID IS NULL;
+
+            -- Step 4: Make the target node an orphan by setting its PARENT_ID to NULL.
+            UPDATE nodes
+            SET PARENT_ID = NULL
+            WHERE NAME = :name_bv
+              AND PARENT_ID = :source_id_bv
+              AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
+
+            -- Step 5: Perform a CASCADING position reset on the newly created orphan tree.
+            UPDATE nodes
+            SET position_x = NULL,
+                position_y = NULL
+            WHERE id IN (
+                SELECT id FROM nodes
+                START WITH NAME = :name_bv AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) AND PARENT_ID IS NULL
+                CONNECT BY PRIOR id = parent_id
+            )
+            AND (position_mode IS NULL OR position_mode != 1);
+
+            -- Step 6: Reset positions for the former siblings that remained connected.
+            UPDATE nodes
+            SET position_x = NULL,
+                position_y = NULL
+            WHERE PARENT_ID = :source_id_bv
+              AND (position_mode != 1 OR position_mode IS NULL);
+              
+            COMMIT; -- Commit the transaction only on success
+
+        ELSE
+            -- If the authorization check fails, raise a custom error.
+            RAISE_APPLICATION_ERROR(-20001, 'Permission denied to modify this component.');
         END IF;
 
-        -- --- THIS IS THE FIX ---
-        -- Step 3: Perform a CASCADING position reset on the newly created orphan tree.
-        UPDATE nodes
-        SET position_x = NULL,
-            position_y = NULL
-        WHERE id IN (
-            -- Find the new orphan root and ALL of its descendants
-            SELECT id FROM nodes
-            START WITH NAME = :name_bv AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) AND PARENT_ID IS NULL
-            CONNECT BY PRIOR id = parent_id
-        )
-        AND (position_mode IS NULL OR position_mode != 1);
-
-        -- Step 4: Reset positions for the former siblings that remained connected.
-        UPDATE nodes
-        SET position_x = NULL,
-            position_y = NULL
-        WHERE PARENT_ID = :source_id_bv
-          AND (position_mode != 1 OR position_mode IS NULL);
-
+    EXCEPTION
+        -- This handles the case where the initial SELECT finds no matching edge.
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20002, 'No matching connection found to delete.');
     END;
     """
 
@@ -757,14 +946,17 @@ def delete_edge(edge_info: EdgeDeleteByName):
         conn = get_connection()
         cursor = conn.cursor()
 
+        # Pass all necessary parameters, including role and area for authorization
         params = {
             "name_bv": edge_info.name,
             "source_id_bv": edge_info.source_id,
             "sw_id_bv": edge_info.sw_id,
+            "role_id": current_user.role_id,
+            "area_id": current_user.area_id,
         }
 
         cursor.execute(plsql_block, params)
-        conn.commit()
+        # The COMMIT is now handled inside the successful PL/SQL block
 
         return {
             "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed."
@@ -775,10 +967,18 @@ def delete_edge(edge_info: EdgeDeleteByName):
             conn.rollback()
 
         (error,) = e.args
+        # Handle the specific custom errors raised from the PL/SQL block
+        if "Permission denied" in error.message:
+            raise HTTPException(
+                status_code=403,
+                detail="Permission denied. You do not have ownership of this component.",
+            )
         if "No matching connection found" in error.message:
             raise HTTPException(
                 status_code=404, detail="The specified connection record was not found."
             )
+
+        # General fallback for other database errors
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     finally:

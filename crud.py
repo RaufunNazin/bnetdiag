@@ -1,17 +1,47 @@
-from fastapi import FastAPI, HTTPException
-from typing import List, Dict, Any
+from fastapi import HTTPException, status
+from typing import List, Dict, Any, Optional
 import oracledb
 from database import get_connection
+from auth import User
 
 
-# In crud.py
-
-
-def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
+def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cursor):
     """
-    Fetches data from the 'nodes' table.
-    - If root_node_id is provided, it fetches that node and all its descendants.
-    - If root_node_id is None, it fetches the general network view.
+    SECURITY HELPER: Checks if a user has permission to access a specific node
+    by matching their area_id.
+    """
+    # This logic now applies to BOTH Admins and Resellers
+    if current_user.role_id in [2, 3]:
+        # User must have an area_id assigned to them to view any components.
+        if current_user.area_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account is not assigned to an area.",
+            )
+
+        sql = "SELECT area_id FROM nodes WHERE id = :node_id"
+        cursor.execute(sql, {"node_id": node_id})
+        row = cursor.fetchone()
+
+        # If the node doesn't exist or the area_id doesn't match, deny permission.
+        if not row or row[0] != current_user.area_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: You do not have access to this component.",
+            )
+        return
+
+    # Any other role is denied by default.
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="You are not authorized to view this data.",
+    )
+
+
+def get_data(root_node_id: Optional[int], current_user: User) -> List[Dict[str, Any]]:
+    """
+    Fetches data from the 'nodes' table, strictly applying area_id authorization
+    for both Admins (role_id 2) and Resellers (role_id 3).
     """
     conn = None
     try:
@@ -20,38 +50,47 @@ def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
 
         sql = ""
         params = {}
+        auth_clause = ""
+        auth_clause_connect_by = ""
 
+        # --- Simplified Authorization Logic ---
+        # If user is not an Admin or Reseller, they see nothing.
+        if current_user.role_id not in [2, 3]:
+            return []
+
+        # If they are an Admin or Reseller, they MUST have an area_id.
+        if current_user.area_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account is not assigned to an area.",
+            )
+
+        # The same filter applies to both roles now.
+        auth_clause = " AND n.area_id = :user_area_id"
+        auth_clause_connect_by = " AND PRIOR n.area_id = :user_area_id"
+        params["user_area_id"] = current_user.area_id
+
+        # (The rest of your SQL logic remains the same)
+        # --- SQL Query Logic ---
         if root_node_id is not None:
-            # --- FIX: Use a hierarchical query for specific views ---
-            sql = """
-                -- Query 1: Get the main node and all of its descendants (no change here)
-                SELECT * FROM nodes
-                START WITH id = :root_node_id_bv
-                CONNECT BY PRIOR id = parent_id
-    
-                UNION
-
-                -- Query 2: Get all nodes that BELONG to an orphan tree in the same system
-                SELECT * FROM nodes
-                WHERE id IN (
-                    -- This subquery finds the IDs of all nodes in every orphan tree
-                    SELECT id FROM nodes
-                    -- START WITH finds the top of each orphan chain in the correct system
-                    START WITH parent_id IS NULL
-                        AND sw_id = :root_node_id_bv
-                    -- CONNECT BY travels down each of those chains to get all descendants
-                    CONNECT BY PRIOR id = parent_id
-                )
-            """
+            _check_node_ownership(root_node_id, current_user, cursor)
             params["root_node_id_bv"] = root_node_id
+            auth_clause_sub = auth_clause.replace(" n.", " nn.")
+            auth_clause_sub_connect_by = auth_clause_connect_by.replace(" n.", " nn.")
+            sql = f"""
+                SELECT n.* FROM nodes n WHERE 1=1 {auth_clause} START WITH n.id = :root_node_id_bv CONNECT BY PRIOR n.id = n.parent_id {auth_clause_connect_by}
+                UNION
+                SELECT n.* FROM nodes n WHERE n.id IN (
+                    SELECT nn.id FROM nodes nn START WITH nn.parent_id IS NULL AND nn.sw_id = :root_node_id_bv {auth_clause_sub} CONNECT BY PRIOR nn.id = nn.parent_id {auth_clause_sub_connect_by}
+                ) {auth_clause}
+            """
         else:
-            # Logic for the general network view (unchanged)
-            sql = """
-                SELECT * FROM nodes
-                WHERE node_type NOT IN ('PON', 'ONU') AND (parent_id IS NULL OR parent_id NOT IN (
-                    SELECT id FROM nodes
-                    WHERE node_type IN ('OLT', 'PON', 'ONU') AND sw_id IS NOT NULL
-                )) AND sw_id IS NULL
+            sql = f"""
+                SELECT n.* FROM nodes n
+                WHERE (n.node_type NOT IN ('PON', 'ONU') AND (n.parent_id IS NULL OR n.parent_id NOT IN (
+                    SELECT id FROM nodes WHERE node_type IN ('OLT', 'PON', 'ONU') AND sw_id IS NOT NULL
+                )) AND n.sw_id IS NULL)
+                {auth_clause}
             """
 
         cursor.execute(sql, params)
@@ -59,11 +98,7 @@ def get_data(root_node_id: int = None) -> List[Dict[str, Any]]:
         rows = cursor.fetchall()
         cursor.close()
 
-        if not rows:
-            return []
-
-        data = [dict(zip(columns, row)) for row in rows]
-        return data
+        return [dict(zip(columns, row)) for row in rows] if rows else []
 
     except oracledb.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
