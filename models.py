@@ -4,6 +4,7 @@ from datetime import datetime
 
 
 class NodeUpdate(BaseModel):
+    original_name: str
     name: Optional[str] = None
     sw_id: Optional[int] = None
     parent_id: Optional[int] = None

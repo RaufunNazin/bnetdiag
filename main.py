@@ -271,10 +271,10 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
 @app.get("/nodes/root-candidates", response_model=List[Dict[str, Any]])
 def get_root_candidates(current_user: User = Depends(get_current_user)):
     """
-    Returns a list of nodes that can be used as a root in the general view
-    (Routers and Switches).
+    Returns a list of nodes that can be used as a root, filtered by the
+    user's area_id.
     """
-    # --- UNIFIED AUTHORIZATION ---
+    # --- UNIFIED AUTHORIZATION CHECK ---
     if current_user.role_id not in [2, 3]:
         raise HTTPException(status_code=403, detail="Not authorized.")
     if current_user.area_id is None:
@@ -282,25 +282,22 @@ def get_root_candidates(current_user: User = Depends(get_current_user)):
             status_code=403, detail="Your account is not assigned to an area."
         )
 
-    sql += " AND area_id = :area_id ORDER BY name"
-    params["area_id"] = current_user.area_id
-
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
+
+        # Define the base SQL query first
         sql = """
             SELECT id, name FROM nodes 
             WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch')
         """
+        # Define the params dictionary
         params = {}
 
-        # --- Authorization ---
-        if current_user.role_id == 3:
-            sql += " AND area_id = :area_id"
-            params["area_id"] = current_user.area_id
-
-        sql += " ORDER BY name"
+        # Apply the area_id filter for all authorized users
+        sql += " AND area_id = :area_id ORDER BY name"
+        params["area_id"] = current_user.area_id
 
         cursor.execute(sql, params)
         columns = [desc[0].lower() for desc in cursor.description]
@@ -414,7 +411,6 @@ def insert_node(
         for key in all_node_keys:
             params.setdefault(key, None)
 
-        params["role_id"] = current_user.role_id
         params["area_id"] = current_user.area_id
         params["parent_id"] = insert_data.original_source_id
         params["original_edge_record_id"] = (
@@ -550,11 +546,6 @@ def update_device(
 ):
     update_data = node_update.dict(exclude_unset=True)
 
-    # --- Start of Debugging ---
-    print("\n--- UPDATE DEVICE REQUEST ---")
-    print(f"Received data: {update_data}")
-    # --- End of Debugging ---
-
     if "original_name" not in update_data:
         raise HTTPException(
             status_code=400,
@@ -566,6 +557,7 @@ def update_device(
         conn = get_connection()
         cursor = conn.cursor()
 
+        # This line correctly prevents area_id from ever being updated.
         fields_to_set = {
             k: v
             for k, v in update_data.items()
@@ -577,17 +569,14 @@ def update_device(
 
         set_clauses = [f"{key} = :{key}" for key in fields_to_set.keys()]
 
-        if current_user.role_id == 3 and "area_id" in fields_to_set:
-            del fields_to_set["area_id"]  # Prevent reseller from changing area
-
         sw_id_clause = (
             "SW_ID = :sw_id" if node_update.sw_id is not None else "SW_ID IS NULL"
         )
 
-        auth_clause = ""
         params = fields_to_set
-        params["original_name"] = node_update.original_name
 
+        # --- UNIFIED AUTHORIZATION ---
+        # Ensures the user can only update a device within their own area.
         if current_user.role_id not in [2, 3]:
             raise HTTPException(status_code=403, detail="Not authorized.")
         if current_user.area_id is None:
@@ -598,6 +587,8 @@ def update_device(
         auth_clause = " AND area_id = :area_id"
         params["area_id"] = current_user.area_id
 
+        # Add remaining identifiers to params
+        params["original_name"] = node_update.original_name
         if node_update.sw_id is not None:
             params["sw_id"] = node_update.sw_id
 
@@ -605,35 +596,23 @@ def update_device(
             UPDATE nodes 
             SET {', '.join(set_clauses)}
             WHERE NAME = :original_name 
-            AND {sw_id_clause}
-            {auth_clause} 
+              AND {sw_id_clause}
+              {auth_clause} 
         """
-
-        params["original_name"] = node_update.original_name
-        if node_update.sw_id is not None:
-            params["sw_id"] = node_update.sw_id
-
-        # --- More Debugging ---
-        print(f"Executing SQL: {sql.strip()}")
-        print(f"With parameters: {params}")
-        # --- End of Debugging ---
 
         cursor.execute(sql, params)
 
-        # --- Final Debugging Check ---
-        print(f"Rows affected: {cursor.rowcount}")
-        # --- End of Debugging ---
-
         if cursor.rowcount == 0:
             conn.rollback()
+            # More specific error message
             raise HTTPException(
                 status_code=404,
-                detail=f"No nodes found with name '{node_update.original_name}' for the specified system.",
+                detail=f"No nodes found with name '{node_update.original_name}' in your area.",
             )
 
         conn.commit()
         return {
-            "message": f"All records for device '{node_update.original_name}' were updated successfully."
+            "message": f"Device '{node_update.original_name}' was updated successfully."
         }
 
     except oracledb.Error as e:
@@ -739,7 +718,6 @@ def copy_device(copy_request: NodeCopy, current_user: User = Depends(get_current
         params = {
             "source_node_id": copy_request.source_node_id,
             "new_parent_id": copy_request.new_parent_id,
-            "role_id": current_user.role_id,
             "area_id": current_user.area_id,
         }
 
@@ -839,7 +817,6 @@ def delete_node(
         params = {
             "name_bv": node_info.name,
             "sw_id_bv": node_info.sw_id,
-            "role_id": current_user.role_id,
             "area_id": current_user.area_id,
         }
 
@@ -951,7 +928,6 @@ def delete_edge(
             "name_bv": edge_info.name,
             "source_id_bv": edge_info.source_id,
             "sw_id_bv": edge_info.sw_id,
-            "role_id": current_user.role_id,
             "area_id": current_user.area_id,
         }
 
