@@ -52,6 +52,9 @@ def read_root():
     """
     return {"message": "FastAPI is running. Visit /token to login."}
 
+@app.get("/test-oracle")
+def test_oracle():
+    
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
