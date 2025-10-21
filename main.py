@@ -52,9 +52,57 @@ def read_root():
     """
     return {"message": "FastAPI is running. Visit /token to login."}
 
+
 @app.get("/test-oracle")
-def test_oracle():
-    
+def test_oracle_connection():
+    """
+    Gets a connection from the database module, executes a simple query,
+    and returns the result.
+    """
+    conn = None  # Initialize connection to None
+    try:
+        # Get a connection using the new function
+        conn = get_connection()
+        print("✅ Connection successful!")
+
+        # Create a cursor to execute SQL commands
+        cursor = conn.cursor()
+
+        # Define and execute the query
+        sql = "SELECT user, sysdate FROM dual"
+        print(f"Executing query: {sql}")
+        cursor.execute(sql)
+
+        # Fetch the result
+        result = cursor.fetchone()
+        cursor.close()
+
+        if result:
+            db_user, db_date = result
+            return {
+                "status": "success",
+                "database_user": "db_user",
+                "database_time": db_date.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Query returned no results.")
+
+    except oracledb.Error as e:
+        # Handle any database-related errors
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+    except Exception as e:
+        # Handle other unexpected errors
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )
+
+    finally:
+        # VERY IMPORTANT: Ensure the connection is always closed
+        if conn:
+            conn.close()
+            print("Connection closed.")
+
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
