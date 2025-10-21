@@ -122,7 +122,7 @@ def get_onu_customer_details(
                 )
 
             cursor.execute(
-                "SELECT area_id FROM switches WHERE id = :olt_id_bv",
+                "SELECT area_id FROM nodes WHERE id = :olt_id_bv",
                 {"olt_id_bv": olt_id},
             )
             row = cursor.fetchone()
