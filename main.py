@@ -5,6 +5,7 @@ from fastapi.security import OAuth2PasswordRequestForm  # <-- Add this
 from datetime import timedelta  # <-- Add this
 import oracledb
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from database import get_connection
 from crud import get_data
 from models import (
@@ -43,6 +44,8 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.get("/")
@@ -189,17 +192,17 @@ def get_onu_customer_details(
 
         # --- Main Query (proceeds if user is admin or passed the check) ---
         sql = """
-            SELECT port, portno, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
+            SELECT port, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
                    expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
                    nvl(class_id,-1) cls, is_online3 (h.user_id) online1, GET_USER_STATUS(h.user_id) st2,
                    sysdate-m.udate diff
-            FROM OLT_CUSTOMER_MAC_2 m, switch_snmp_onu_ports p, home_conn h
+            FROM OLT_CUSTOMER_MAC_2 m, nodes p, home_conn h
             WHERE h.user_id=m.user_id
-              AND p.ifdescr=m.port
+              AND p.name=m.port
               AND m.olt_id=p.sw_id
               AND m.olt_id = :olt_id_bv
               AND m.port = :port_name_bv
-            ORDER BY m.port, portno
+            ORDER BY m.port
         """
 
         params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
@@ -210,7 +213,70 @@ def get_onu_customer_details(
         rows = cursor.fetchall()
 
         results = [dict(zip(columns, row)) for row in rows]
-        return results
+
+        return [
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882011229,
+                "uname": "1882010429",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A8",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 1,
+                "st2": "Expired",
+                "diff": 119.83287037037037
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882010229,
+                "uname": "18820102229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A9",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "OK",
+                "diff": 119.83287037037037
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882010223,
+                "uname": "1882410229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A1",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "Disabled",
+                "diff": 119.83287037037037
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882410223,
+                "uname": "1882410229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:35:5D:A1",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "Locked",
+                "diff": 119.83287037037037
+            }
+        ]
+
 
     except oracledb.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
