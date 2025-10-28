@@ -228,7 +228,7 @@ def get_onu_customer_details(
                 "cls": -1,
                 "online1": 1,
                 "st2": "Expired",
-                "diff": 119.83287037037037
+                "diff": 119.83287037037037,
             },
             {
                 "port": "EPON0/2:1",
@@ -243,7 +243,7 @@ def get_onu_customer_details(
                 "cls": -1,
                 "online1": 0,
                 "st2": "OK",
-                "diff": 119.83287037037037
+                "diff": 119.83287037037037,
             },
             {
                 "port": "EPON0/2:1",
@@ -258,7 +258,7 @@ def get_onu_customer_details(
                 "cls": -1,
                 "online1": 0,
                 "st2": "Disabled",
-                "diff": 119.83287037037037
+                "diff": 119.83287037037037,
             },
             {
                 "port": "EPON0/2:1",
@@ -273,10 +273,9 @@ def get_onu_customer_details(
                 "cls": -1,
                 "online1": 0,
                 "st2": "Locked",
-                "diff": 119.83287037037037
-            }
+                "diff": 119.83287037037037,
+            },
         ]
-
 
     except oracledb.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -434,60 +433,69 @@ def insert_node(
 ):
     """
     Inserts a new node into an existing connection by updating the original
-    connection record to point to the new node.
+    connection record to point to the new node. Includes authorization and
+    refined position reset logic.
     """
+    # --- UPDATED PL/SQL BLOCK ---
     plsql_block = """
         DECLARE
-            v_new_node_id nodes.id%TYPE;
-            v_area_id     nodes.area_id%TYPE;
+            v_new_node_id       nodes.id%TYPE;
+            v_parent_area_id    nodes.area_id%TYPE; -- Area of the node BEFORE insertion point
         BEGIN
-            -- Step 1: Check permissions by getting area_id of the parent
-            SELECT area_id INTO v_area_id
+            -- Step 1: Check permissions by getting area_id of the original parent node
+            SELECT area_id INTO v_parent_area_id
             FROM nodes
-            WHERE id = :original_source_id;
+            WHERE id = :original_source_id; -- Use the correct bind variable
 
-            -- Step 2: Enforce authorization
-            IF (v_parent_area_id = :area_id) THEN
+            -- Step 2: Enforce authorization (Corrected variable name)
+            IF (v_parent_area_id = :area_id) THEN -- Use v_parent_area_id
+
                 -- Step 3: Insert the new node, inheriting the parent's area_id
                 INSERT INTO nodes (
-                    id, name, node_type, parent_id, sw_id, link_type, brand, model, 
-                    serial_no, mac, ip, split_ratio, split_group, cable_id, 
-                    cable_start, cable_end, cable_length, cable_color, cable_desc, 
-                    vlan, lat1, long1, remarks, position_x, position_y,
-                    area_id -- <-- Add area_id
+                    id, name, node_type, parent_id, sw_id, link_type, brand, model,
+                    serial_no, mac, ip, split_ratio, split_group, cable_id,
+                    cable_start, cable_end, cable_length, cable_color, cable_desc,
+                    vlan, lat1, long1, remarks, position_x, position_y, position_mode,
+                    area_id -- Added area_id
                 ) VALUES (
-                    nodes_sq.NEXTVAL, :name, :node_type, :parent_id, :sw_id, :link_type, :brand, :model,
+                    nodes_sq.NEXTVAL, :name, :node_type, :original_source_id, :sw_id, :link_type, :brand, :model,
                     :serial_no, :mac, :ip, :split_ratio, :split_group, :cable_id,
                     :cable_start, :cable_end, :cable_length, :cable_color, :cable_desc,
-                    :vlan, :lat1, :long1, :remarks, :position_x, :position_y,
-                    v_area_id -- <-- Use parent's area_id
+                    :vlan, :lat1, :long1, :remarks, :position_x, :position_y, 0, -- Default position_mode to 0 (auto)
+                    v_parent_area_id -- Inherit parent's area_id
                 ) RETURNING id INTO v_new_node_id;
 
-                -- Step 4: Update the ORIGINAL connection record
+                -- Step 4: Update the ORIGINAL child node (identified by original_edge_record_id)
+                -- to point its parent_id to the NEWLY inserted node.
                 UPDATE nodes
                 SET parent_id = v_new_node_id
                 WHERE id = :original_edge_record_id;
 
-                -- Step 5: Reset positions (your existing logic)
+                -- Step 5: Reset positions (Refined Logic)
+                -- Reset all children of the ORIGINAL parent (including the newly inserted node and the original child)
+                -- AND reset all descendants of the ORIGINAL child node.
                 UPDATE nodes
                 SET position_x = NULL,
                     position_y = NULL
                 WHERE
                     (
-                        parent_id = :parent_id
+                        -- All direct children of the original parent
+                        parent_id = :original_source_id
                         OR
+                        -- All descendants of the original child node
                         id IN (
                             SELECT id FROM nodes
                             START WITH id = :original_edge_record_id
                             CONNECT BY PRIOR id = parent_id
                         )
                     )
+                    -- Only reset if not manually positioned
                     AND (position_mode IS NULL OR position_mode != 1);
-                
+
                 COMMIT;
-            
+
             ELSE
-                RAISE_APPLICATION_ERROR(-20001, 'Permission denied.');
+                RAISE_APPLICATION_ERROR(-20001, 'Permission denied. Parent component must be in your area.');
             END IF;
         END;
     """
@@ -496,9 +504,10 @@ def insert_node(
         conn = get_connection()
         cursor = conn.cursor()
 
+        # Prepare base parameters from the new node data
         params = insert_data.new_node_data
 
-        # Corrected list of all possible keys
+        # Ensure all possible node fields have a default if not provided
         all_node_keys = [
             "name",
             "node_type",
@@ -524,32 +533,42 @@ def insert_node(
             "position_x",
             "position_y",
         ]
-
         for key in all_node_keys:
-            params.setdefault(key, None)
+            params.setdefault(key, None)  # Use .dict() results directly
 
-        params["area_id"] = current_user.area_id
-        params["parent_id"] = insert_data.original_source_id
-        params["original_edge_record_id"] = (
-            insert_data.original_edge_record_id
-        )  # Use the new param
+        # --- ADD MISSING & CONTEXTUAL PARAMETERS ---
+        params["area_id"] = current_user.area_id  # For authorization check
+        # Explicitly add the original_source_id for the PL/SQL block
+        params["original_source_id"] = insert_data.original_source_id
+        # Add the ID of the node that was originally connected
+        params["original_edge_record_id"] = insert_data.original_edge_record_id
+
+        # Note: The 'parent_id' for the INSERT statement in PL/SQL now correctly uses :original_source_id
 
         cursor.execute(plsql_block, params)
-        conn.commit()
+        # Commit is handled within the PL/SQL block on success
 
         return {"message": "Node inserted successfully."}
 
     except oracledb.DatabaseError as e:
         if conn:
-            conn.rollback()
-        if "Permission denied" in str(e):
+            conn.rollback()  # Ensure rollback on failure
+        (error,) = e.args  # Get the Oracle error object
+        # Check for specific custom errors raised
+        if "Permission denied" in error.message:
             raise HTTPException(
-                status_code=403, detail="Permission denied to modify this component."
+                status_code=403,
+                detail="Permission denied. Parent component must be in your area.",
             )
+        # Check for other potential Oracle errors like NO_DATA_FOUND if needed
+        # elif error.code == 1403: # Example: ORA-01403: no data found
+        #     raise HTTPException(status_code=404, detail="Original parent or child node not found.")
+
+        # General fallback
         raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
     finally:
         if conn:
-            conn.close()
+            conn.close()  # Return connection to pool
 
 
 @app.post("/device", status_code=201)
