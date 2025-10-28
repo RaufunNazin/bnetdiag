@@ -987,18 +987,19 @@ def delete_edge(
 ):
     """
     Disconnects a node from its parent by setting its parent_id to NULL.
+    Also resets positions for the source node, target node, and their descendants,
+    respecting manually placed nodes.
     - Admins can disconnect any node.
     - Resellers can only disconnect nodes within their own area_id.
     """
-    # This PL/SQL block now includes the authorization check.
-    # The operation is atomic: if the user lacks permission, no changes are made.
+    # --- UPDATED PL/SQL BLOCK ---
     plsql_block = """
     DECLARE
         v_child_area_id nodes.area_id%TYPE;
+        v_target_node_id nodes.id%TYPE; -- Store the ID of the node being orphaned
     BEGIN
-        -- Step 1: Find the area_id of the specific node being disconnected to check permissions.
-        -- We must find the exact record representing the connection to be broken.
-        SELECT area_id INTO v_child_area_id
+        -- Step 1: Find the area_id and ID of the specific node being disconnected.
+        SELECT area_id, id INTO v_child_area_id, v_target_node_id
         FROM nodes
         WHERE NAME = :name_bv
           AND PARENT_ID = :source_id_bv
@@ -1006,7 +1007,6 @@ def delete_edge(
         FETCH FIRST 1 ROWS ONLY; -- Ensures we only get one row
 
         -- Step 2: Enforce Authorization.
-        -- The operation proceeds only if the user is an admin OR the component's area matches the reseller's area.
         IF (v_child_area_id = :area_id) THEN
 
             -- Step 3: Delete any pre-existing orphan to prevent conflicts.
@@ -1016,30 +1016,35 @@ def delete_edge(
               AND PARENT_ID IS NULL;
 
             -- Step 4: Make the target node an orphan by setting its PARENT_ID to NULL.
+            -- Use the ID we fetched earlier for precision.
             UPDATE nodes
             SET PARENT_ID = NULL
-            WHERE NAME = :name_bv
-              AND PARENT_ID = :source_id_bv
-              AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1);
+            WHERE id = v_target_node_id;
 
-            -- Step 5: Perform a CASCADING position reset on the newly created orphan tree.
+            -- Step 5: (NEW) Reset positions for the SOURCE node and its descendants.
             UPDATE nodes
             SET position_x = NULL,
-                position_y = NULL
+                position_y = NULL,
+                position_mode = 0
             WHERE id IN (
                 SELECT id FROM nodes
-                START WITH NAME = :name_bv AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1) AND PARENT_ID IS NULL
+                START WITH id = :source_id_bv -- Start with the source node
                 CONNECT BY PRIOR id = parent_id
             )
-            AND (position_mode IS NULL OR position_mode != 1);
+            AND (position_mode IS NULL OR position_mode != 1); -- Don't reset manual positions
 
-            -- Step 6: Reset positions for the former siblings that remained connected.
+            -- Step 6: (NEW) Reset positions for the TARGET node (now orphaned) and its descendants.
             UPDATE nodes
             SET position_x = NULL,
-                position_y = NULL
-            WHERE PARENT_ID = :source_id_bv
-              AND (position_mode != 1 OR position_mode IS NULL);
-              
+                position_y = NULL,
+                position_mode = 0
+            WHERE id IN (
+                SELECT id FROM nodes
+                START WITH id = v_target_node_id -- Start with the target node
+                CONNECT BY PRIOR id = parent_id
+            )
+            AND (position_mode IS NULL OR position_mode != 1); -- Don't reset manual positions
+
             COMMIT; -- Commit the transaction only on success
 
         ELSE
@@ -1059,7 +1064,6 @@ def delete_edge(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Pass all necessary parameters, including role and area for authorization
         params = {
             "name_bv": edge_info.name,
             "source_id_bv": edge_info.source_id,
@@ -1068,18 +1072,17 @@ def delete_edge(
         }
 
         cursor.execute(plsql_block, params)
-        # The COMMIT is now handled inside the successful PL/SQL block
+        # Commit is handled inside PL/SQL
 
         return {
-            "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed."
+            "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed and positions reset."
         }
 
     except oracledb.DatabaseError as e:
         if conn:
-            conn.rollback()
+            conn.rollback()  # Rollback on error
 
         (error,) = e.args
-        # Handle the specific custom errors raised from the PL/SQL block
         if "Permission denied" in error.message:
             raise HTTPException(
                 status_code=403,
@@ -1090,7 +1093,6 @@ def delete_edge(
                 status_code=404, detail="The specified connection record was not found."
             )
 
-        # General fallback for other database errors
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     finally:
