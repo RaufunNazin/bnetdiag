@@ -571,12 +571,11 @@ def insert_node(
             conn.close()  # Return connection to pool
 
 
-@app.post("/device", status_code=201)
+@app.post("/device", status_code=201, response_model=Dict[str, Any])
 def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)):
     """
-    Creates a new node in the database.
+    Creates a new node in the database and returns the new node object.
     """
-    # Rename 'node_name' from form to 'name' for the database
     node_data = node.dict(exclude_unset=True)
     if "node_name" in node_data:
         node_data["name"] = node_data.pop("node_name")
@@ -597,8 +596,8 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
     # Force the new node to be created in the user's assigned area.
     node_data["area_id"] = current_user.area_id
 
-    # Prepare SQL statement by dynamically getting columns and bind variables
-    columns = node_data.keys()
+    # Prepare SQL statement
+    columns = list(node_data.keys())
     bind_vars = [f":{col}" for col in columns]
 
     # --- Make sure 'area_id' is included in the INSERT
@@ -606,19 +605,57 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
         columns.append("area_id")
         bind_vars.append(":area_id")
 
+    # --- THIS IS THE FIX ---
+    # 1. Add position_mode = 0 (auto) by default for new nodes
+    if "position_mode" not in columns:
+        columns.append("position_mode")
+        bind_vars.append("0")  # Hardcode default auto-position mode
+
+    # 2. Add RETURNING id INTO :new_id to get the new node's ID
     sql = f"""
         INSERT INTO nodes (id, {', '.join(columns)}) 
         VALUES (nodes_sq.NEXTVAL, {', '.join(bind_vars)})
+        RETURNING id INTO :new_id
     """
 
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(sql, node_data)
+
+        # Create a bind variable for the output ID
+        new_id_var = cursor.var(oracledb.NUMBER)
+        params = node_data.copy()
+        params["new_id"] = new_id_var
+
+        # If we hardcoded '0' for position_mode, remove it from params
+        if "position_mode" not in params:
+            sql = sql.replace(":position_mode", "0")
+
+        cursor.execute(sql, params)
+
+        # Retrieve the new ID
+        new_node_id = int(new_id_var.getvalue()[0])
+
+        # 3. Select the newly created node to return it to the frontend
+        cursor.execute("SELECT * FROM nodes WHERE id = :id_bv", {"id_bv": new_node_id})
+
+        # Map the result to a dictionary
+        db_columns = [desc[0].lower() for desc in cursor.description]
+        row = cursor.fetchone()
+
+        if not row:
+            conn.rollback()
+            raise HTTPException(
+                status_code=500, detail="Failed to retrieve newly created node."
+            )
+
+        new_node_obj = dict(zip(db_columns, row))
+
         conn.commit()
 
-        return {"message": f"Node '{node.name}' created successfully."}
+        # 4. Return the full node object
+        return new_node_obj
 
     except oracledb.DatabaseError as e:
         if conn:

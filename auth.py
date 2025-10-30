@@ -18,7 +18,7 @@ load_dotenv()
 # python -c 'import secrets; print(secrets.token_hex(32))'
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60*24  # 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 60*24*5  # 5 days
 
 if not SECRET_KEY:
     raise ValueError("No SECRET_KEY set for JWT. Please create a .env file.")
