@@ -15,7 +15,7 @@ load_dotenv()
 # python -c 'import secrets; print(secrets.token_hex(32))'
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60*24*5
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 5
 
 if not SECRET_KEY:
     raise ValueError("No SECRET_KEY set for JWT. Please create a .env file.")
@@ -28,14 +28,18 @@ class PlainTextContext:
     def hash(self, secret):
         return secret
 
+
 pwd_context = PlainTextContext()
+
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
+
 class TokenData(BaseModel):
     username: Optional[str] = None
+
 
 class User(BaseModel):
     id: int
@@ -44,7 +48,9 @@ class User(BaseModel):
     area_id: Optional[int] = None
     first_name: Optional[str] = None
 
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -55,6 +61,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
 
 def get_user_from_db(username: str) -> Optional[User]:
     """
@@ -86,6 +93,7 @@ def get_user_from_db(username: str) -> Optional[User]:
         if conn:
             conn.close()
 
+
 def get_user_password_from_db(username: str) -> Optional[str]:
     """
     Fetches ONLY the user's password for verification.
@@ -109,6 +117,7 @@ def get_user_password_from_db(username: str) -> Optional[str]:
     finally:
         if conn:
             conn.close()
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     """
@@ -135,6 +144,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     return user
 
+
 async def get_current_admin_user(current_user: User = Depends(get_current_user)):
     if current_user.role_id != 2:
         raise HTTPException(
@@ -142,6 +152,7 @@ async def get_current_admin_user(current_user: User = Depends(get_current_user))
             detail="Operation not permitted: Requires admin privileges.",
         )
     return current_user
+
 
 async def get_current_reseller_user(current_user: User = Depends(get_current_user)):
     if current_user.role_id != 3:

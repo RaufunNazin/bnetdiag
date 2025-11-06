@@ -26,7 +26,7 @@ from auth import (
     get_user_from_db,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     create_access_token,
-    get_current_user
+    get_current_user,
 )
 
 app = FastAPI(title="netdiag-backend", version="1.0.0")
@@ -43,12 +43,14 @@ app.add_middleware(
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+
 @app.get("/")
 def read_root():
     """
     A simple root endpoint to confirm the API is running.
     """
     return {"message": "FastAPI is running. Visit /token to login."}
+
 
 @app.get("/test-oracle")
 def test_oracle_connection():
@@ -93,6 +95,7 @@ def test_oracle_connection():
             conn.close()
             print("Connection closed.")
 
+
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     """
@@ -129,6 +132,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.get(
     "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
@@ -257,6 +261,7 @@ def get_onu_customer_details(
         if conn:
             conn.close()
 
+
 @app.post("/positions/reset", status_code=200)
 def reset_node_positions(
     reset_request: PositionReset, current_user: User = Depends(get_current_user)
@@ -332,6 +337,7 @@ def reset_node_positions(
         if conn:
             conn.close()
 
+
 @app.get("/data", response_model=List[Dict[str, Any]])
 async def read_general_data(current_user: User = Depends(get_current_user)):
     """
@@ -340,12 +346,14 @@ async def read_general_data(current_user: User = Depends(get_current_user)):
     """
     return get_data(root_node_id=None, current_user=current_user)
 
+
 @app.get("/data/{root_node_id}")
 def read_data(root_node_id: int, current_user: User = Depends(get_current_user)):
     """
     Endpoint to get a specific node and all its descendants.
     """
     return get_data(root_node_id=root_node_id, current_user=current_user)
+
 
 @app.get("/nodes/root-candidates", response_model=List[Dict[str, Any]])
 def get_root_candidates(current_user: User = Depends(get_current_user)):
@@ -384,6 +392,7 @@ def get_root_candidates(current_user: User = Depends(get_current_user)):
     finally:
         if conn:
             conn.close()
+
 
 @app.post("/node/insert", status_code=201)
 def insert_node(
@@ -513,6 +522,7 @@ def insert_node(
         if conn:
             conn.close()
 
+
 @app.post("/device", status_code=201, response_model=Dict[str, Any])
 def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)):
     """
@@ -600,6 +610,7 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
         if conn:
             conn.close()
 
+
 @app.get("/olts")
 def get_olts(current_user: User = Depends(get_current_user)):
     conn = None
@@ -632,6 +643,7 @@ def get_olts(current_user: User = Depends(get_current_user)):
     finally:
         if conn:
             conn.close()
+
 
 @app.put("/device", status_code=200)
 def update_device(
@@ -928,6 +940,7 @@ def delete_node(
     finally:
         if conn:
             conn.close()
+
 
 @app.delete("/edge", status_code=200)
 def delete_edge(

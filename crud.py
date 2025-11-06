@@ -4,6 +4,7 @@ import oracledb
 from database import get_connection
 from auth import User
 
+
 def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cursor):
     """
     SECURITY HELPER: Checks if a user has permission to access a specific node
@@ -31,6 +32,7 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
         status_code=status.HTTP_403_FORBIDDEN,
         detail="You are not authorized to view this data.",
     )
+
 
 def get_data(root_node_id: Optional[int], current_user: User) -> List[Dict[str, Any]]:
     """

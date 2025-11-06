@@ -37,6 +37,7 @@ except oracledb.Error as e:
     print(f"❌ Error creating Oracle Connection Pool: {e}")
     raise
 
+
 def get_connection():
     """
     Acquires and returns a connection from the pool.
