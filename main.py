@@ -1,8 +1,8 @@
 # main.py
 from typing import Any, Dict, List
-from fastapi import FastAPI, HTTPException, Request, Depends, status
-from fastapi.security import OAuth2PasswordRequestForm  # <-- Add this
-from datetime import timedelta  # <-- Add this
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
+from datetime import timedelta
 import oracledb
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -26,27 +26,22 @@ from auth import (
     get_user_from_db,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     create_access_token,
-    get_current_user,  # <-- You will need this for other endpoints
+    get_current_user
 )
 
-# Create the FastAPI application instance
 app = FastAPI(title="netdiag-backend", version="1.0.0")
 
 allowed_hosts = ["http://localhost:5173"]
 
-# 2. REMOVE your old @app.middleware("http") function completely.
-
-# 3. ADD the new CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_hosts,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
 
 @app.get("/")
 def read_root():
@@ -55,28 +50,23 @@ def read_root():
     """
     return {"message": "FastAPI is running. Visit /token to login."}
 
-
 @app.get("/test-oracle")
 def test_oracle_connection():
     """
     Gets a connection from the database module, executes a simple query,
     and returns the result.
     """
-    conn = None  # Initialize connection to None
+    conn = None
     try:
-        # Get a connection using the new function
         conn = get_connection()
         print("✅ Connection successful!")
 
-        # Create a cursor to execute SQL commands
         cursor = conn.cursor()
 
-        # Define and execute the query
         sql = "SELECT user, sysdate FROM dual"
         print(f"Executing query: {sql}")
         cursor.execute(sql)
 
-        # Fetch the result
         result = cursor.fetchone()
         cursor.close()
 
@@ -91,32 +81,25 @@ def test_oracle_connection():
             raise HTTPException(status_code=404, detail="Query returned no results.")
 
     except oracledb.Error as e:
-        # Handle any database-related errors
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     except Exception as e:
-        # Handle other unexpected errors
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {e}"
         )
 
     finally:
-        # VERY IMPORTANT: Ensure the connection is always closed
         if conn:
             conn.close()
             print("Connection closed.")
-
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     """
     Login endpoint to verify username/password and issue a JWT.
     """
-    # 1. Get the password from DB (in plaintext, as per your setup)
     hashed_password = get_user_password_from_db(form_data.username)
 
-    # 2. Verify the password
-    # ⚠️ This uses PlainTextContext. See auth.py security note.
     if not hashed_password or not pwd_context.verify(
         form_data.password, hashed_password
     ):
@@ -126,7 +109,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 3. Fetch the full user details to embed in the token
     user = get_user_from_db(form_data.username)
     if not user:
         raise HTTPException(
@@ -134,7 +116,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             detail="Could not find user after login.",
         )
 
-    # 4. Create the JWT
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={
@@ -149,8 +130,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
     return {"access_token": access_token, "token_type": "bearer"}
 
-
-# Add this new function anywhere in main.py
 @app.get(
     "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
 )
@@ -167,9 +146,7 @@ def get_onu_customer_details(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # --- UNIFIED AUTHORIZATION CHECK ---
         if current_user.role_id in [2, 3]:
-            # User must have an assigned area to proceed
             if current_user.area_id is None:
                 raise HTTPException(
                     status_code=403, detail="Your account is not assigned to an area."
@@ -187,10 +164,8 @@ def get_onu_customer_details(
                     detail="Permission denied: You do not own this OLT.",
                 )
         else:
-            # Deny any other role
             raise HTTPException(status_code=403, detail="Not authorized.")
 
-        # --- Main Query (proceeds if user is admin or passed the check) ---
         sql = """
             SELECT port, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
                    expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
@@ -208,7 +183,6 @@ def get_onu_customer_details(
         params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
         cursor.execute(sql, params)
 
-        # Map results to a list of dictionaries
         columns = [desc[0].lower() for desc in cursor.description]
         rows = cursor.fetchall()
 
@@ -283,8 +257,6 @@ def get_onu_customer_details(
         if conn:
             conn.close()
 
-
-# Add this new endpoint function anywhere inside main.py
 @app.post("/positions/reset", status_code=200)
 def reset_node_positions(
     reset_request: PositionReset, current_user: User = Depends(get_current_user)
@@ -301,7 +273,6 @@ def reset_node_positions(
     where_clauses = []
     params = {}
 
-    # --- Authorization ---
     if current_user.role_id not in [2, 3]:
         raise HTTPException(status_code=403, detail="Not authorized.")
     if current_user.area_id is None:
@@ -317,12 +288,9 @@ def reset_node_positions(
         params["node_id"] = reset_request.node_id
     elif reset_request.scope:
         if reset_request.sw_id is not None:
-            # Scope is a specific OLT system
             where_clauses.append("sw_id = :sw_id")
             params["sw_id"] = reset_request.sw_id
         else:
-            # --- THIS IS THE FIX ---
-            # Scope is the general view. Use the same logic as the GET /data endpoint.
             general_view_clause = """
             (node_type NOT IN ('PON', 'ONU') AND (parent_id IS NULL OR parent_id NOT IN (
                 SELECT id FROM nodes
@@ -364,17 +332,13 @@ def reset_node_positions(
         if conn:
             conn.close()
 
-
 @app.get("/data", response_model=List[Dict[str, Any]])
 async def read_general_data(current_user: User = Depends(get_current_user)):
     """
     Endpoint for the general network view.
     Calls get_data without a root_node_id.
     """
-    # --- THIS IS THE FIX ---
-    # The function now expects 'root_node_id', not 'sw_id'.
     return get_data(root_node_id=None, current_user=current_user)
-
 
 @app.get("/data/{root_node_id}")
 def read_data(root_node_id: int, current_user: User = Depends(get_current_user)):
@@ -383,14 +347,12 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
     """
     return get_data(root_node_id=root_node_id, current_user=current_user)
 
-
 @app.get("/nodes/root-candidates", response_model=List[Dict[str, Any]])
 def get_root_candidates(current_user: User = Depends(get_current_user)):
     """
     Returns a list of nodes that can be used as a root, filtered by the
     user's area_id.
     """
-    # --- UNIFIED AUTHORIZATION CHECK ---
     if current_user.role_id not in [2, 3]:
         raise HTTPException(status_code=403, detail="Not authorized.")
     if current_user.area_id is None:
@@ -403,15 +365,12 @@ def get_root_candidates(current_user: User = Depends(get_current_user)):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Define the base SQL query first
         sql = """
             SELECT id, name FROM nodes 
             WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch')
         """
-        # Define the params dictionary
         params = {}
 
-        # Apply the area_id filter for all authorized users
         sql += " AND area_id = :area_id ORDER BY name"
         params["area_id"] = current_user.area_id
 
@@ -426,7 +385,6 @@ def get_root_candidates(current_user: User = Depends(get_current_user)):
         if conn:
             conn.close()
 
-
 @app.post("/node/insert", status_code=201)
 def insert_node(
     insert_data: NodeInsert, current_user: User = Depends(get_current_user)
@@ -436,7 +394,6 @@ def insert_node(
     connection record to point to the new node. Includes authorization and
     refined position reset logic.
     """
-    # --- UPDATED PL/SQL BLOCK ---
     plsql_block = """
         DECLARE
             v_new_node_id       nodes.id%TYPE;
@@ -504,10 +461,8 @@ def insert_node(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Prepare base parameters from the new node data
         params = insert_data.new_node_data
 
-        # Ensure all possible node fields have a default if not provided
         all_node_keys = [
             "name",
             "node_type",
@@ -534,42 +489,29 @@ def insert_node(
             "position_y",
         ]
         for key in all_node_keys:
-            params.setdefault(key, None)  # Use .dict() results directly
+            params.setdefault(key, None)
 
-        # --- ADD MISSING & CONTEXTUAL PARAMETERS ---
-        params["area_id"] = current_user.area_id  # For authorization check
-        # Explicitly add the original_source_id for the PL/SQL block
+        params["area_id"] = current_user.area_id
         params["original_source_id"] = insert_data.original_source_id
-        # Add the ID of the node that was originally connected
         params["original_edge_record_id"] = insert_data.original_edge_record_id
 
-        # Note: The 'parent_id' for the INSERT statement in PL/SQL now correctly uses :original_source_id
-
         cursor.execute(plsql_block, params)
-        # Commit is handled within the PL/SQL block on success
 
         return {"message": "Node inserted successfully."}
 
     except oracledb.DatabaseError as e:
         if conn:
-            conn.rollback()  # Ensure rollback on failure
-        (error,) = e.args  # Get the Oracle error object
-        # Check for specific custom errors raised
+            conn.rollback()
+        (error,) = e.args
         if "Permission denied" in error.message:
             raise HTTPException(
                 status_code=403,
                 detail="Permission denied. Parent component must be in your area.",
             )
-        # Check for other potential Oracle errors like NO_DATA_FOUND if needed
-        # elif error.code == 1403: # Example: ORA-01403: no data found
-        #     raise HTTPException(status_code=404, detail="Original parent or child node not found.")
-
-        # General fallback
         raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
     finally:
         if conn:
-            conn.close()  # Return connection to pool
-
+            conn.close()
 
 @app.post("/device", status_code=201, response_model=Dict[str, Any])
 def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)):
@@ -582,7 +524,6 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
     if "device" in node_data:
         node_data["node_type"] = node_data.pop("device")
 
-    # --- Simplified Authorization Logic ---
     if current_user.role_id not in [2, 3]:
         raise HTTPException(
             status_code=403, detail="Not authorized to create components."
@@ -593,25 +534,19 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
             status_code=403, detail="Your account is not assigned to an area."
         )
 
-    # Force the new node to be created in the user's assigned area.
     node_data["area_id"] = current_user.area_id
 
-    # Prepare SQL statement
     columns = list(node_data.keys())
     bind_vars = [f":{col}" for col in columns]
 
-    # --- Make sure 'area_id' is included in the INSERT
     if "area_id" not in columns:
         columns.append("area_id")
         bind_vars.append(":area_id")
 
-    # --- THIS IS THE FIX ---
-    # 1. Add position_mode = 0 (auto) by default for new nodes
     if "position_mode" not in columns:
         columns.append("position_mode")
-        bind_vars.append("0")  # Hardcode default auto-position mode
+        bind_vars.append("0")
 
-    # 2. Add RETURNING id INTO :new_id to get the new node's ID
     sql = f"""
         INSERT INTO nodes (id, {', '.join(columns)}) 
         VALUES (nodes_sq.NEXTVAL, {', '.join(bind_vars)})
@@ -623,24 +558,19 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Create a bind variable for the output ID
         new_id_var = cursor.var(oracledb.NUMBER)
         params = node_data.copy()
         params["new_id"] = new_id_var
 
-        # If we hardcoded '0' for position_mode, remove it from params
         if "position_mode" not in params:
             sql = sql.replace(":position_mode", "0")
 
         cursor.execute(sql, params)
 
-        # Retrieve the new ID
         new_node_id = int(new_id_var.getvalue()[0])
 
-        # 3. Select the newly created node to return it to the frontend
         cursor.execute("SELECT * FROM nodes WHERE id = :id_bv", {"id_bv": new_node_id})
 
-        # Map the result to a dictionary
         db_columns = [desc[0].lower() for desc in cursor.description]
         row = cursor.fetchone()
 
@@ -654,13 +584,11 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
 
         conn.commit()
 
-        # 4. Return the full node object
         return new_node_obj
 
     except oracledb.DatabaseError as e:
         if conn:
             conn.rollback()
-        # Check for unique constraint violation
         (error,) = e.args
         if error.code == 1:
             raise HTTPException(
@@ -672,14 +600,12 @@ def create_node(node: NodeCreate, current_user: User = Depends(get_current_user)
         if conn:
             conn.close()
 
-
 @app.get("/olts")
 def get_olts(current_user: User = Depends(get_current_user)):
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        # Query to get all switches of type 'OLT'
         sql = "SELECT id, name, olt_type, ip FROM switches WHERE SW_TYPE = 'OLT'"
         params = {}
 
@@ -694,12 +620,10 @@ def get_olts(current_user: User = Depends(get_current_user)):
         params["area_id"] = current_user.area_id
         cursor.execute(sql, params)
 
-        # Fetch all results and column names
         rows = cursor.fetchall()
         columns = [desc[0].lower() for desc in cursor.description]
         cursor.close()
 
-        # Create a list of dictionaries
         olts = [dict(zip(columns, row)) for row in rows]
         return olts
 
@@ -708,10 +632,6 @@ def get_olts(current_user: User = Depends(get_current_user)):
     finally:
         if conn:
             conn.close()
-
-
-# In main.py
-
 
 @app.put("/device", status_code=200)
 def update_device(
@@ -730,7 +650,6 @@ def update_device(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # This line correctly prevents area_id from ever being updated.
         fields_to_set = {
             k: v
             for k, v in update_data.items()
@@ -748,8 +667,6 @@ def update_device(
 
         params = fields_to_set
 
-        # --- UNIFIED AUTHORIZATION ---
-        # Ensures the user can only update a device within their own area.
         if current_user.role_id not in [2, 3]:
             raise HTTPException(status_code=403, detail="Not authorized.")
         if current_user.area_id is None:
@@ -760,7 +677,6 @@ def update_device(
         auth_clause = " AND area_id = :area_id"
         params["area_id"] = current_user.area_id
 
-        # Add remaining identifiers to params
         params["original_name"] = node_update.original_name
         if node_update.sw_id is not None:
             params["sw_id"] = node_update.sw_id
@@ -777,7 +693,6 @@ def update_device(
 
         if cursor.rowcount == 0:
             conn.rollback()
-            # More specific error message
             raise HTTPException(
                 status_code=404,
                 detail=f"No nodes found with name '{node_update.original_name}' in your area.",
@@ -1014,10 +929,6 @@ def delete_node(
         if conn:
             conn.close()
 
-
-# In main.py, find and replace the entire /edge delete endpoint function
-
-
 @app.delete("/edge", status_code=200)
 def delete_edge(
     edge_info: EdgeDeleteByName, current_user: User = Depends(get_current_user)
@@ -1029,7 +940,6 @@ def delete_edge(
     - Admins can disconnect any node.
     - Resellers can only disconnect nodes within their own area_id.
     """
-    # --- UPDATED PL/SQL BLOCK ---
     plsql_block = """
     DECLARE
         v_child_area_id nodes.area_id%TYPE;
@@ -1109,7 +1019,6 @@ def delete_edge(
         }
 
         cursor.execute(plsql_block, params)
-        # Commit is handled inside PL/SQL
 
         return {
             "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed and positions reset."
@@ -1117,7 +1026,7 @@ def delete_edge(
 
     except oracledb.DatabaseError as e:
         if conn:
-            conn.rollback()  # Rollback on error
+            conn.rollback()
 
         (error,) = e.args
         if "Permission denied" in error.message:
