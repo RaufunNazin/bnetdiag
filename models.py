@@ -47,7 +47,6 @@ class OnuCustomerInfo(BaseModel):
     online1: Optional[int] = None
     st2: Optional[str] = None
     diff: Optional[float] = None
-    # Add other fields from your query if needed
 
 
 class NodeCopy(BaseModel):
@@ -57,14 +56,14 @@ class NodeCopy(BaseModel):
 
 class PositionReset(BaseModel):
     sw_id: Optional[int] = None
-    scope: Optional[str] = None  # Expected values: "all" or "manual"
+    scope: Optional[str] = None
     node_id: Optional[int] = None
 
 
 class EdgeDeleteByName(BaseModel):
-    name: str  # The 'name' of the child node (e.g., "EPON0/5:1")
-    source_id: int  # The 'id' of the parent node (e.g., the PON's ID)
-    sw_id: Optional[int] = None  # The 'id' of the OLT
+    name: str
+    source_id: int
+    sw_id: Optional[int] = None
 
 
 class NodeDeleteByName(BaseModel):
@@ -101,4 +100,4 @@ class NodeCreate(BaseModel):
 class NodeInsert(BaseModel):
     new_node_data: Dict[str, Any]
     original_source_id: int
-    original_edge_record_id: int  # Changed from original_target_id
+    original_edge_record_id: int
