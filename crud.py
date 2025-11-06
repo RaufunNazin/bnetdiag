@@ -4,15 +4,12 @@ import oracledb
 from database import get_connection
 from auth import User
 
-
 def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cursor):
     """
     SECURITY HELPER: Checks if a user has permission to access a specific node
     by matching their area_id.
     """
-    # This logic now applies to BOTH Admins and Resellers
     if current_user.role_id in [2, 3]:
-        # User must have an area_id assigned to them to view any components.
         if current_user.area_id is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -23,7 +20,6 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
         cursor.execute(sql, {"node_id": node_id})
         row = cursor.fetchone()
 
-        # If the node doesn't exist or the area_id doesn't match, deny permission.
         if not row or row[0] != current_user.area_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -31,12 +27,10 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
             )
         return
 
-    # Any other role is denied by default.
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="You are not authorized to view this data.",
     )
-
 
 def get_data(root_node_id: Optional[int], current_user: User) -> List[Dict[str, Any]]:
     """
@@ -53,25 +47,19 @@ def get_data(root_node_id: Optional[int], current_user: User) -> List[Dict[str, 
         auth_clause = ""
         auth_clause_connect_by = ""
 
-        # --- Simplified Authorization Logic ---
-        # If user is not an Admin or Reseller, they see nothing.
         if current_user.role_id not in [2, 3]:
             return []
 
-        # If they are an Admin or Reseller, they MUST have an area_id.
         if current_user.area_id is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your account is not assigned to an area.",
             )
 
-        # The same filter applies to both roles now.
         auth_clause = " AND n.area_id = :user_area_id"
         auth_clause_connect_by = " AND PRIOR n.area_id = :user_area_id"
         params["user_area_id"] = current_user.area_id
 
-        # (The rest of your SQL logic remains the same)
-        # --- SQL Query Logic ---
         if root_node_id is not None:
             _check_node_ownership(root_node_id, current_user, cursor)
             params["root_node_id_bv"] = root_node_id
