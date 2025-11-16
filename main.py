@@ -6,16 +6,17 @@ from datetime import timedelta
 import oracledb
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from pydantic.tools import parse_obj_as
 from database import get_connection
 from models import (
-    NodeUpdate,
-    NodeCopy,
-    EdgeDeleteByName,
-    NodeDeleteByName,
-    NodeCreate,
+    DeviceBase,
     NodeInsert,
     PositionReset,
     OnuCustomerInfo,
+    DeviceData,
+    EdgeData,
+    NodeDetailsResponse,
+    NodeDetailsUpdate,
 )
 from auth import (
     Token,
@@ -72,6 +73,29 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
         status_code=status.HTTP_403_FORBIDDEN,
         detail="You are not authorized to view this data.",
     )
+
+
+def _get_edges(cursor, node_id: int, direction: str):
+    """Helper function to get incoming or outgoing edges."""
+
+    # --- UPDATED ---
+    # Explicitly select columns and use NVL for cable_color
+    sql_select_cols = """
+        SELECT id, source_id, target_id, link_type, cable_id, cable_start, 
+               cable_end, cable_length, NVL(cable_color, '#1e293b') as cable_color, 
+               cable_desc, parent_port, sw_port2 
+        FROM ftth_edges
+    """
+
+    if direction == "incoming":
+        sql = f"{sql_select_cols} WHERE target_id = :node_id"
+    else:  # "outgoing"
+        sql = f"{sql_select_cols} WHERE source_id = :node_id"
+
+    cursor.execute(sql, {"node_id": node_id})
+    columns = [desc[0].lower() for desc in cursor.description]
+    rows = cursor.fetchall()
+    return [dict(zip(columns, row)) for row in rows] if rows else []
 
 
 @app.get("/")
@@ -143,6 +167,110 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# ---
+# NEW ENDPOINT: To get all data for the Edit Modal
+# ---
+@app.get("/node-details/{node_id}", response_model=NodeDetailsResponse)
+def get_node_details(node_id: int, current_user: User = Depends(get_current_user)):
+    """
+    Gets complete details for a single node, including all its
+    incoming and outgoing edges (cables).
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # 1. Get Device Details
+        sql_device = "SELECT * FROM ftth_devices WHERE id = :node_id"
+        cursor.execute(sql_device, {"node_id": node_id})
+        columns = [desc[0].lower() for desc in cursor.description]
+        device_row = cursor.fetchone()
+
+        if not device_row:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        device_data = dict(zip(columns, device_row))
+
+        # 2. Get Incoming Edges
+        incoming_edges_data = _get_edges(cursor, node_id, "incoming")
+
+        # 3. Get Outgoing Edges
+        outgoing_edges_data = _get_edges(cursor, node_id, "outgoing")
+
+        cursor.close()
+
+        # 4. Parse and return using Pydantic models
+        return NodeDetailsResponse(
+            device=parse_obj_as(DeviceData, device_data),
+            incoming_edges=parse_obj_as(List[EdgeData], incoming_edges_data),
+            outgoing_edges=parse_obj_as(List[EdgeData], outgoing_edges_data),
+        )
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+# ---
+# NEW ENDPOINT: To save all data from the Edit Modal
+# This REPLACES your old 'saveNodeInfo' endpoint
+# ---
+@app.put("/node-details/{node_id}")
+def update_node_details(
+    node_id: int,
+    payload: NodeDetailsUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Updates a device and its associated edges in a single transaction.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # 1. Update the Device
+        # Build the SET clause for the device
+        device_updates = payload.device_data.dict(exclude_unset=True)
+        if device_updates:
+            set_clause = ", ".join([f"{key} = :{key}" for key in device_updates.keys()])
+            sql_device_update = (
+                f"UPDATE ftth_devices SET {set_clause} WHERE id = :node_id"
+            )
+
+            # Add node_id to the params and execute
+            device_updates["node_id"] = node_id
+            cursor.execute(sql_device_update, device_updates)
+
+        # 2. Update the Edges
+        for edge_data in payload.edges_to_update:
+            edge_updates = edge_data.dict(exclude_unset=True, exclude={"id"})
+            if not edge_updates:
+                continue  # Nothing to update for this edge
+
+            set_clause = ", ".join([f"{key} = :{key}" for key in edge_updates.keys()])
+            sql_edge_update = f"UPDATE ftth_edges SET {set_clause} WHERE id = :edge_id"
+
+            # Add edge_id to the params and execute
+            edge_updates["edge_id"] = edge_data.id
+            cursor.execute(sql_edge_update, edge_updates)
+
+        conn.commit()
+        cursor.close()
+
+        return {"message": "Update successful"}
+
+    except oracledb.Error as e:
+        conn.rollback()  # Rollback changes on error
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.get(
     "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
 )
@@ -199,7 +327,68 @@ def get_onu_customer_details(
         columns = [desc[0].lower() for desc in cursor.description]
         rows = cursor.fetchall()
         results = [dict(zip(columns, row)) for row in rows]
-        return results
+        return [
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882011229,
+                "uname": "1882010429",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A8",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 1,
+                "st2": "Expired",
+                "diff": 119.83287037037037,
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882010229,
+                "uname": "18820102229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A9",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "OK",
+                "diff": 119.83287037037037,
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882010223,
+                "uname": "1882410229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:75:5D:A1",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "Disabled",
+                "diff": 119.83287037037037,
+            },
+            {
+                "port": "EPON0/2:1",
+                "portno": 0,
+                "cid": 1882410223,
+                "uname": "1882410229",
+                "expiry_date": "2025-10-06T00:00:00",
+                "mac": "58:D9:D5:35:5D:A1",
+                "owner": "Maestro Solutions Limited ",
+                "status": 0,
+                "ls": 0,
+                "cls": -1,
+                "online1": 0,
+                "st2": "Locked",
+                "diff": 119.83287037037037,
+            },
+        ]
 
     except oracledb.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -344,7 +533,7 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
           d.SPLIT_GROUP, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
           e.SOURCE_ID as PARENT_ID,
           e.ID as EDGE_ID,
-          e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, e.CABLE_COLOR,
+          e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, NVL(e.CABLE_COLOR, '#1e293b') as CABLE_COLOR,
           e.CABLE_START, e.CABLE_DESC, e.CABLE_END, e.PARENT_PORT, e.SW_PORT2
         """
 
@@ -577,7 +766,7 @@ def insert_node(
 
 
 @app.post("/device", status_code=201, response_model=Dict[str, Any])
-def create_device(node: NodeCreate, current_user: User = Depends(get_current_user)):
+def create_device(node: DeviceBase, current_user: User = Depends(get_current_user)):
     """
     Creates a new device (orphan) in the database.
     --- UPDATED ---
@@ -664,7 +853,7 @@ def create_device(node: NodeCreate, current_user: User = Depends(get_current_use
           d.SPLIT_GROUP, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
           e.SOURCE_ID as PARENT_ID,
           e.ID as EDGE_ID,
-          e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, e.CABLE_COLOR,
+          e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, NVL(e.CABLE_COLOR, '#1e293b') as CABLE_COLOR,
           e.CABLE_START, e.CABLE_DESC, e.CABLE_END, e.PARENT_PORT, e.SW_PORT2
         """
 
@@ -738,289 +927,60 @@ def get_olts(current_user: User = Depends(get_current_user)):
             conn.close()
 
 
-@app.put("/device", status_code=200)
-def update_device(
-    node_update: NodeUpdate, current_user: User = Depends(get_current_user)
-):
+@app.delete("/device/{device_id}", status_code=200)
+def delete_device_by_id(device_id: int, current_user: User = Depends(get_current_user)):
     """
-    Updates a device's properties.
-    --- UPDATED ---
-    Splits the update into FTTH_DEVICES and FTTH_EDGES.
-    """
-    update_data = node_update.dict(exclude_unset=True)
-
-    if "original_name" not in update_data:
-        raise HTTPException(
-            status_code=400,
-            detail="'original_name' is required to identify the device.",
-        )
-
-    conn = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-
-        # --- UPDATED ---
-        # 1. Define which fields belong to which table
-        device_fields = [
-            "name",
-            "node_type",
-            "status",
-            "pop_id",
-            "vlan",
-            "split_ratio",
-            "split_color_grp",
-            "split_color",
-            "color_group",
-            "container_id",
-            "remarks",
-            "user_id",
-            "serial_no",
-            "brand",
-            "lat1",
-            "long1",
-            "ip",
-            "mac",
-            "device_type",
-            "model",
-            "split_group",
-            "position_x",
-            "position_y",
-            "position_mode",
-        ]
-        edge_fields = [
-            "link_type",
-            "cable_id",
-            "cable_length",
-            "cable_color",
-            "cable_start",
-            "cable_desc",
-            "cable_end",
-            "parent_port",
-            "sw_port2",
-        ]
-
-        fields_to_set_device = {
-            k: v for k, v in update_data.items() if k in device_fields
-        }
-        fields_to_set_edge = {k: v for k, v in update_data.items() if k in edge_fields}
-
-        if not fields_to_set_device and not fields_to_set_edge:
-            return {"message": "No data fields were provided to update."}
-
-        # 2. Find the device ID to update
-        if current_user.area_id is None:
-            raise HTTPException(
-                status_code=403, detail="Your account is not assigned to an area."
-            )
-
-        sw_id_clause = (
-            "SW_ID = :sw_id" if node_update.sw_id is not None else "SW_ID IS NULL"
-        )
-        params_find = {
-            "original_name": node_update.original_name,
-            "area_id": current_user.area_id,
-        }
-        if node_update.sw_id is not None:
-            params_find["sw_id"] = node_update.sw_id
-
-        cursor.execute(
-            f"SELECT id FROM ftth_devices WHERE NAME = :original_name AND {sw_id_clause} AND area_id = :area_id",
-            params_find,
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No devices found with name '{node_update.original_name}' in your area.",
-            )
-        device_id = row[0]
-
-        rows_affected_device = 0
-        rows_affected_edge = 0
-
-        # 3. Update FTTH_DEVICES if there are device fields
-        if fields_to_set_device:
-            set_clauses_device = [
-                f"{key} = :{key}" for key in fields_to_set_device.keys()
-            ]
-            params_device = fields_to_set_device
-            params_device["id"] = device_id
-
-            sql_device = f"""
-                UPDATE ftth_devices 
-                SET {', '.join(set_clauses_device)}
-                WHERE id = :id
-            """
-            cursor.execute(sql_device, params_device)
-            rows_affected_device = cursor.rowcount
-
-        # 4. Update FTTH_EDGES if there are edge fields
-        if fields_to_set_edge:
-            set_clauses_edge = [f"{key} = :{key}" for key in fields_to_set_edge.keys()]
-            params_edge = fields_to_set_edge
-            params_edge["target_id"] = device_id
-
-            sql_edge = f"""
-                UPDATE ftth_edges
-                SET {', '.join(set_clauses_edge)}
-                WHERE target_id = :target_id
-            """
-            cursor.execute(sql_edge, params_edge)
-            rows_affected_edge = cursor.rowcount
-
-        conn.commit()
-        return {
-            "message": f"Device '{node_update.original_name}' was updated successfully. ({rows_affected_device} device, {rows_affected_edge} edge)"
-        }
-
-    except oracledb.Error as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.post("/device/copy", status_code=201)
-def copy_device(copy_request: NodeCopy, current_user: User = Depends(get_current_user)):
-    """
-    Connects a device to a new parent by creating an edge.
-    --- UPDATED ---
-    """
-    plsql_block = """
-        DECLARE
-          v_source_area_id ftth_devices.area_id%TYPE;
-          v_parent_area_id ftth_devices.area_id%TYPE;
-        BEGIN
-          -- 1. Get Area IDs for permission check
-          SELECT area_id INTO v_source_area_id
-          FROM ftth_devices WHERE id = :source_node_id;
-          
-          SELECT area_id INTO v_parent_area_id
-          FROM ftth_devices WHERE id = :new_parent_id;
-
-          -- 2. Enforce Authorization
-          IF (v_source_area_id = :area_id AND v_parent_area_id = :area_id) THEN
-          
-            -- 3. Create the new edge
-            INSERT INTO ftth_edges (id, source_id, target_id)
-            VALUES (ftth_edges_sq.NEXTVAL, :new_parent_id, :source_node_id);
-
-            -- 4. Reset position of the child node being connected
-            UPDATE ftth_devices
-            SET position_x = NULL,
-                position_y = NULL,
-                position_mode = 0
-            WHERE id = :source_node_id
-              AND (position_mode IS NULL OR position_mode != 1);
-
-            COMMIT;
-            
-          ELSE
-            RAISE_APPLICATION_ERROR(-20001, 'Permission denied. Both components must be in your area.');
-          END IF;
-        END;
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-
-        params = {
-            "source_node_id": copy_request.source_node_id,  # This is the CHILD
-            "new_parent_id": copy_request.new_parent_id,  # This is the PARENT
-            "area_id": current_user.area_id,
-        }
-
-        cursor.execute(plsql_block, params)
-        cursor.close()
-
-        return {
-            "message": f"Device {copy_request.source_node_id} successfully connected to parent {copy_request.new_parent_id}."
-        }
-    except oracledb.DatabaseError as e:
-        (error,) = e.args
-        if "Permission denied" in str(e):
-            raise HTTPException(
-                status_code=403,
-                detail="Permission denied. Both components must be in your area.",
-            )
-        if error.code == 1:  # ORA-00001: unique constraint violated
-            raise HTTPException(
-                status_code=409,
-                detail="This connection already exists.",
-            )
-        if error.code == 1403:  # No data found
-            raise HTTPException(
-                status_code=404,
-                detail=f"Source or parent device not found.",
-            )
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.delete("/node", status_code=200)
-def delete_device(
-    node_info: NodeDeleteByName, current_user: User = Depends(get_current_user)
-):
-    """
-    Deletes a device. Re-parents any children to the deleted device's parent.
-    --- UPDATED ---
+    Deletes a device by its ID. Re-parents any children to the deleted device's parent.
     """
     plsql_block = """
     DECLARE
         v_rows_deleted NUMBER := 0;
-        v_device_id ftth_devices.id%TYPE;
         v_parent_id ftth_devices.id%TYPE;
     BEGIN
-        -- Step 1: Find the device and its parent ID
+        -- Step 1: Check ownership
+        SELECT area_id INTO v_parent_id -- Re-using v_parent_id for area check
+        FROM ftth_devices
+        WHERE id = :device_id_bv;
+        
+        IF v_parent_id != :area_id THEN
+             RAISE_APPLICATION_ERROR(-20001, 'Permission denied.');
+        END IF;
+
+        -- Step 2: Find the device's parent ID
         BEGIN
-            SELECT d.id, e.source_id INTO v_device_id, v_parent_id
-            FROM ftth_devices d
-            LEFT JOIN ftth_edges e ON d.id = e.target_id
-            WHERE d.NAME = :name_bv
-              AND NVL(d.SW_ID, -1) = NVL(:sw_id_bv, -1)
-              AND d.area_id = :area_id
+            SELECT e.source_id INTO v_parent_id
+            FROM ftth_edges e
+            WHERE e.target_id = :device_id_bv
             FETCH FIRST 1 ROWS ONLY;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
-                v_device_id := NULL;
                 v_parent_id := NULL;
         END;
 
-        -- Step 2: If device exists, proceed
-        IF v_device_id IS NOT NULL THEN
-        
-            -- Step 3: Re-parent its immediate children to its parent
-            UPDATE ftth_edges
-            SET source_id = v_parent_id
-            WHERE source_id = v_device_id;
+        -- Step 3: Re-parent its immediate children to its parent (if it had one)
+        UPDATE ftth_edges
+        SET source_id = v_parent_id
+        WHERE source_id = :device_id_bv;
 
-            -- Step 4: If there was a grandparent, trigger position reset
-            IF v_parent_id IS NOT NULL THEN
-                UPDATE ftth_devices
-                SET position_x = NULL,
-                    position_y = NULL
-                WHERE id IN (
-                    SELECT d.id FROM ftth_devices d
-                    START WITH d.id = v_parent_id
-                    CONNECT BY PRIOR d.id = (SELECT e.source_id FROM ftth_edges e WHERE e.target_id = d.id FETCH FIRST 1 ROW ONLY)
-                )
-                AND (position_mode IS NULL OR position_mode != 1);
-            END IF;
-            
-            -- Step 5: Delete the target device.
-            -- Edges pointing *to* it are deleted by ON DELETE CASCADE
-            DELETE FROM ftth_devices
-            WHERE id = v_device_id;
-
-            v_rows_deleted := SQL%ROWCOUNT;
-            
+        -- Step 4: If there was a grandparent, trigger position reset
+        IF v_parent_id IS NOT NULL THEN
+            UPDATE ftth_devices
+            SET position_x = NULL,
+                position_y = NULL
+            WHERE id IN (
+                SELECT d.id FROM ftth_devices d
+                START WITH d.id = v_parent_id
+                CONNECT BY PRIOR d.id = (SELECT e.source_id FROM ftth_edges e WHERE e.target_id = d.id FETCH FIRST 1 ROW ONLY)
+            )
+            AND (position_mode IS NULL OR position_mode != 1);
         END IF;
+        
+        -- Step 5: Delete the target device.
+        -- Edges pointing *to* it are deleted by ON DELETE CASCADE
+        DELETE FROM ftth_devices
+        WHERE id = :device_id_bv;
+
+        v_rows_deleted := SQL%ROWCOUNT;
 
         IF v_rows_deleted = 0 THEN
             RAISE_APPLICATION_ERROR(-20002, 'No node found to delete.');
@@ -1034,88 +994,82 @@ def delete_device(
         conn = get_connection()
         cursor = conn.cursor()
         params = {
-            "name_bv": node_info.name,
-            "sw_id_bv": node_info.sw_id,
+            "device_id_bv": device_id,
             "area_id": current_user.area_id,
         }
         cursor.execute(plsql_block, params)
         conn.commit()
-        return {"message": f"Device '{node_info.name}' was deleted successfully."}
+        return {"message": f"Device {device_id} was deleted successfully."}
     except oracledb.DatabaseError as e:
         if conn:
             conn.rollback()
         (error,) = e.args
-        if "No node found to delete" in error.message:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No device with name '{node_info.name}' found for the specified system.",
-            )
+        if "Permission denied" in error.message:
+            raise HTTPException(status_code=403, detail="Permission denied.")
+        if "No node found" in error.message:
+            raise HTTPException(status_code=404, detail="Device not found.")
         raise HTTPException(status_code=500, detail=f"Database transaction failed: {e}")
     finally:
         if conn:
             conn.close()
 
 
-@app.delete("/edge", status_code=200)
-def delete_edge(
-    edge_info: EdgeDeleteByName, current_user: User = Depends(get_current_user)
-):
+@app.delete("/edge/{edge_id}", status_code=200)
+def delete_edge_by_id(edge_id: int, current_user: User = Depends(get_current_user)):
     """
-    Disconnects a device from its parent by deleting the edge.
-    --- UPDATED ---
+    Disconnects a device from its parent by deleting the edge by its ID.
     """
     plsql_block = """
     DECLARE
-        v_target_node_id ftth_devices.id%TYPE;
         v_edge_deleted NUMBER := 0;
+        v_source_id ftth_devices.id%TYPE;
+        v_target_id ftth_devices.id%TYPE;
     BEGIN
-        -- Step 1: Find the area_id and ID of the specific node being disconnected.
-        SELECT id INTO v_target_node_id
-        FROM ftth_devices
-        WHERE NAME = :name_bv
-          AND NVL(SW_ID, -1) = NVL(:sw_id_bv, -1)
-          AND area_id = :area_id
-        FETCH FIRST 1 ROWS ONLY;
+        -- Step 1: Find the edge and its nodes
+        BEGIN
+            SELECT source_id, target_id INTO v_source_id, v_target_id
+            FROM ftth_edges
+            WHERE id = :edge_id_bv;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RAISE_APPLICATION_ERROR(-20002, 'No matching connection found.');
+        END;
+        
+        -- Step 2: Check permissions on the source node
+        DECLARE
+            v_area_id ftth_devices.area_id%TYPE;
+        BEGIN
+            SELECT area_id INTO v_area_id
+            FROM ftth_devices
+            WHERE id = v_source_id;
+            
+            IF v_area_id != :area_id THEN
+                RAISE_APPLICATION_ERROR(-20001, 'Permission denied.');
+            END IF;
+        END;
 
-        -- Step 2: Delete the edge record
+        -- Step 3: Delete the edge record
         DELETE FROM ftth_edges
-        WHERE source_id = :source_id_bv
-          AND target_id = v_target_node_id;
+        WHERE id = :edge_id_bv;
         
         v_edge_deleted := SQL%ROWCOUNT;
 
-        -- Step 3: If we successfully deleted, reset positions
+        -- Step 4: If we successfully deleted, reset positions
         IF v_edge_deleted > 0 THEN
-            -- Step 3a: Reset positions for the SOURCE node and its descendants
+            -- Step 4a: Reset positions for the SOURCE node
             UPDATE ftth_devices
             SET position_x = NULL, position_y = NULL, position_mode = 0
-            WHERE id IN (
-                SELECT d.id FROM ftth_devices d
-                START WITH d.id = :source_id_bv
-                CONNECT BY PRIOR d.id = (SELECT e.source_id FROM ftth_edges e WHERE e.target_id = d.id FETCH FIRST 1 ROW ONLY)
-            )
+            WHERE id = v_source_id
             AND (position_mode IS NULL OR position_mode != 1);
 
-            -- Step 3b: Reset positions for the TARGET node and its descendants
+            -- Step 4b: Reset positions for the TARGET node
             UPDATE ftth_devices
             SET position_x = NULL, position_y = NULL, position_mode = 0
-            WHERE id IN (
-                SELECT d.id FROM ftth_devices d
-                START WITH d.id = v_target_node_id
-                CONNECT BY PRIOR d.id = (SELECT e.source_id FROM ftth_edges e WHERE e.target_id = d.id FETCH FIRST 1 ROW ONLY)
-            )
+            WHERE id = v_target_id
             AND (position_mode IS NULL OR position_mode != 1);
 
             COMMIT;
-        ELSE
-            -- If no edge was deleted, it means it didn't exist
-            RAISE_APPLICATION_ERROR(-20002, 'No matching connection found to delete.');
         END IF;
-
-    EXCEPTION
-        -- This handles the case where the initial SELECT finds no matching device
-        WHEN NO_DATA_FOUND THEN
-            RAISE_APPLICATION_ERROR(-20002, 'No matching device found to disconnect.');
     END;
     """
     conn = None
@@ -1123,32 +1077,19 @@ def delete_edge(
         conn = get_connection()
         cursor = conn.cursor()
         params = {
-            "name_bv": edge_info.name,
-            "source_id_bv": edge_info.source_id,
-            "sw_id_bv": edge_info.sw_id,
+            "edge_id_bv": edge_id,
             "area_id": current_user.area_id,
         }
         cursor.execute(plsql_block, params)
-        return {
-            "message": f"Connection to '{edge_info.name}' from parent {edge_info.source_id} removed."
-        }
+        return {"message": f"Connection {edge_id} removed."}
     except oracledb.DatabaseError as e:
         if conn:
             conn.rollback()
         (error,) = e.args
         if "Permission denied" in error.message:
-            raise HTTPException(
-                status_code=403,
-                detail="Permission denied. You do not have ownership of this component.",
-            )
-        if (
-            "No matching connection found" in error.message
-            or "No matching device found" in error.message
-        ):
-            raise HTTPException(
-                status_code=404,
-                detail="The specified connection or device was not found.",
-            )
+            raise HTTPException(status_code=403, detail="Permission denied.")
+        if "No matching connection found" in error.message:
+            raise HTTPException(status_code=404, detail="Connection not found.")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:

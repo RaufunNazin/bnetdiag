@@ -1,15 +1,14 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 
-class NodeUpdate(BaseModel):
-    original_name: str
+class DeviceBase(BaseModel):
+    """Base fields for a device from ftth_devices."""
+
     name: Optional[str] = None
-    sw_id: Optional[int] = None
-    parent_id: Optional[int] = None
     node_type: Optional[str] = None
-    link_type: Optional[str] = None
+    sw_id: Optional[int] = None
     brand: Optional[str] = None
     model: Optional[str] = None
     serial_no: Optional[str] = None
@@ -17,12 +16,6 @@ class NodeUpdate(BaseModel):
     ip: Optional[str] = None
     split_ratio: Optional[int] = None
     split_group: Optional[str] = None
-    cable_id: Optional[str] = None
-    cable_start: Optional[int] = None
-    cable_end: Optional[int] = None
-    cable_length: Optional[int] = None
-    cable_color: Optional[str] = None
-    cable_desc: Optional[str] = None
     lat1: Optional[float] = None
     long1: Optional[float] = None
     vlan: Optional[str] = None
@@ -31,6 +24,85 @@ class NodeUpdate(BaseModel):
     position_x: Optional[float] = None
     position_y: Optional[float] = None
     position_mode: Optional[int] = None
+    # --- Add any other fields from your ftth_devices table ---
+    status: Optional[int] = None
+    pop_id: Optional[int] = None
+    color_group: Optional[str] = None
+    container_id: Optional[int] = None
+    area_id: Optional[int] = None
+    device_type: Optional[str] = None
+
+
+class EdgeBase(BaseModel):
+    """Base fields for an edge from ftth_edges."""
+
+    link_type: Optional[str] = None
+    cable_id: Optional[str] = None
+    cable_start: Optional[int] = None
+    cable_end: Optional[int] = None
+    cable_length: Optional[int] = None
+    cable_color: Optional[str] = None
+    cable_desc: Optional[str] = None
+
+
+# --- Models for GET /node-details/{node_id} ---
+
+
+class DeviceData(DeviceBase):
+    """Device data returned from the API."""
+
+    id: int
+    name: str  # Make name required in the response
+
+
+class EdgeData(EdgeBase):
+    """Edge data returned from the API."""
+
+    id: int  # The edge's primary key
+    source_id: int
+    target_id: int
+
+
+class NodeDetailsResponse(BaseModel):
+    """
+    The complete response for the Edit Node Modal.
+    Contains the device and ALL its connected edges.
+    """
+
+    device: DeviceData
+    incoming_edges: List[EdgeData]
+    outgoing_edges: List[EdgeData]
+
+
+# --- Models for PUT /node-details/{node_id} ---
+
+
+class DeviceUpdate(DeviceBase):
+    """Payload for updating just the device fields."""
+
+    # All fields are optional, inheriting from DeviceBase
+    pass
+
+
+class EdgeUpdate(EdgeBase):
+    """Payload for updating a single edge."""
+
+    id: int  # Required to know *which* edge to update in the DB
+
+
+class NodeDetailsUpdate(BaseModel):
+    """
+    The new, complete payload to save all changes from the edit modal.
+    This REPLACES the old flat 'NodeUpdate' model.
+    """
+
+    device_data: DeviceUpdate
+    edges_to_update: List[EdgeUpdate]  # A list of all edges that were modified
+
+
+# =======================================================
+# === Other Models (Unchanged) ==========================
+# =======================================================
 
 
 class OnuCustomerInfo(BaseModel):
@@ -49,52 +121,10 @@ class OnuCustomerInfo(BaseModel):
     diff: Optional[float] = None
 
 
-class NodeCopy(BaseModel):
-    source_node_id: int
-    new_parent_id: int
-
-
 class PositionReset(BaseModel):
     sw_id: Optional[int] = None
     scope: Optional[str] = None
     node_id: Optional[int] = None
-
-
-class EdgeDeleteByName(BaseModel):
-    name: str
-    source_id: int
-    sw_id: Optional[int] = None
-
-
-class NodeDeleteByName(BaseModel):
-    name: str
-    sw_id: Optional[int] = None
-
-
-class NodeCreate(BaseModel):
-    name: str
-    sw_id: Optional[int] = None
-    parent_id: Optional[int] = None
-    node_type: Optional[str] = None
-    link_type: Optional[str] = None
-    brand: Optional[str] = None
-    model: Optional[str] = None
-    serial_no: Optional[str] = None
-    mac: Optional[str] = None
-    ip: Optional[str] = None
-    split_ratio: Optional[int] = None
-    split_group: Optional[str] = None
-    cable_id: Optional[str] = None
-    cable_start: Optional[int] = None
-    cable_end: Optional[int] = None
-    cable_length: Optional[int] = None
-    cable_color: Optional[str] = None
-    cable_desc: Optional[str] = None
-    lat1: Optional[float] = None
-    long1: Optional[float] = None
-    vlan: Optional[str] = None
-    location: Optional[str] = None
-    remarks: Optional[str] = None
 
 
 class NodeInsert(BaseModel):
