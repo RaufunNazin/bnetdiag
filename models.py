@@ -3,6 +3,13 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 
+class EdgeCreate(BaseModel):
+    source_id: int
+    target_id: int
+    link_type: Optional[str] = "Fiber Optic"
+    cable_color: Optional[str] = "#1e293b"
+
+
 class DeviceBase(BaseModel):
     """Base fields for a device from ftth_devices."""
 

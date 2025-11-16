@@ -17,6 +17,7 @@ from models import (
     EdgeData,
     NodeDetailsResponse,
     NodeDetailsUpdate,
+    EdgeCreate,
 )
 from auth import (
     Token,
@@ -1090,6 +1091,85 @@ def delete_edge_by_id(edge_id: int, current_user: User = Depends(get_current_use
             raise HTTPException(status_code=403, detail="Permission denied.")
         if "No matching connection found" in error.message:
             raise HTTPException(status_code=404, detail="Connection not found.")
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/edge", status_code=201)
+def create_edge(edge: EdgeCreate, current_user: User = Depends(get_current_user)):
+    """
+    Creates a new edge (connection) between two devices.
+    """
+    plsql_block = """
+    DECLARE
+      v_source_area_id ftth_devices.area_id%TYPE;
+      v_target_area_id ftth_devices.area_id%TYPE;
+    BEGIN
+      -- 1. Get Area IDs for permission check
+      SELECT area_id INTO v_source_area_id
+      FROM ftth_devices WHERE id = :source_id;
+      
+      SELECT area_id INTO v_target_area_id
+      FROM ftth_devices WHERE id = :target_id;
+
+      -- 2. Enforce Authorization (must own both nodes)
+      IF (v_source_area_id = :area_id AND v_target_area_id = :area_id) THEN
+      
+        -- 3. Create the new edge
+        INSERT INTO ftth_edges (id, source_id, target_id, link_type, cable_color)
+        VALUES (ftth_edges_sq.NEXTVAL, :source_id, :target_id, :link_type, :cable_color);
+
+        -- 4. Reset position of the child node being connected
+        UPDATE ftth_devices
+        SET position_x = NULL,
+            position_y = NULL,
+            position_mode = 0
+        WHERE id = :target_id
+          AND (position_mode IS NULL OR position_mode != 1);
+
+        COMMIT;
+        
+      ELSE
+        RAISE_APPLICATION_ERROR(-20001, 'Permission denied. Both components must be in your area.');
+      END IF;
+    END;
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        params = edge.dict()
+        params["area_id"] = current_user.area_id
+
+        # Add defaults if not provided (though model has them, good to be safe)
+        if not params.get("link_type"):
+            params["link_type"] = "Fiber Optic"
+        if not params.get("cable_color"):
+            params["cable_color"] = "#1e293b"
+
+        cursor.execute(plsql_block, params)
+        cursor.close()
+
+        return {"message": "Connection created successfully."}
+    except oracledb.DatabaseError as e:
+        (error,) = e.args
+        if "Permission denied" in str(e):
+            raise HTTPException(
+                status_code=403,
+                detail="Permission denied. Both components must be in your area.",
+            )
+        if error.code == 1:  # Unique constraint
+            raise HTTPException(
+                status_code=409,
+                detail="This connection already exists.",
+            )
+        if error.code == 1403:  # No data found
+            raise HTTPException(
+                status_code=404,
+                detail="Source or target device not found.",
+            )
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:
