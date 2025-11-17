@@ -18,6 +18,7 @@ from models import (
     NodeDetailsResponse,
     NodeDetailsUpdate,
     EdgeCreate,
+    EdgeBase,
 )
 from auth import (
     Token,
@@ -1170,6 +1171,104 @@ def create_edge(edge: EdgeCreate, current_user: User = Depends(get_current_user)
                 status_code=404,
                 detail="Source or target device not found.",
             )
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/edge/{edge_id}", response_model=EdgeData)
+def get_edge_details(edge_id: int, current_user: User = Depends(get_current_user)):
+    """
+    Gets complete details for a single edge.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Check permission on the source node of the edge
+        sql_perm = """
+            SELECT d.area_id 
+            FROM ftth_devices d
+            JOIN ftth_edges e ON d.id = e.source_id
+            WHERE e.id = :edge_id
+        """
+        cursor.execute(sql_perm, {"edge_id": edge_id})
+        row = cursor.fetchone()
+
+        if not row or row[0] != current_user.area_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: You do not have access to this cable.",
+            )
+
+        # Get edge details
+        sql_edge = "SELECT * FROM ftth_edges WHERE id = :edge_id"
+        cursor.execute(sql_edge, {"edge_id": edge_id})
+        columns = [desc[0].lower() for desc in cursor.description]
+        edge_row = cursor.fetchone()
+
+        if not edge_row:
+            raise HTTPException(status_code=404, detail="Edge not found")
+
+        cursor.close()
+        return dict(zip(columns, edge_row))
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.put("/edge/{edge_id}")
+def update_edge_details(
+    edge_id: int,
+    payload: EdgeBase,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Updates a single edge's properties.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Check permission on the source node of the edge
+        sql_perm = """
+            SELECT d.area_id 
+            FROM ftth_devices d
+            JOIN ftth_edges e ON d.id = e.source_id
+            WHERE e.id = :edge_id
+        """
+        cursor.execute(sql_perm, {"edge_id": edge_id})
+        row = cursor.fetchone()
+
+        if not row or row[0] != current_user.area_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: You do not have access to this cable.",
+            )
+
+        # Update the edge
+        edge_updates = payload.dict(exclude_unset=True)
+        if not edge_updates:
+            return {"message": "No data provided to update."}
+
+        set_clause = ", ".join([f"{key} = :{key}" for key in edge_updates.keys()])
+        sql_edge_update = f"UPDATE ftth_edges SET {set_clause} WHERE id = :edge_id"
+
+        edge_updates["edge_id"] = edge_id
+        cursor.execute(sql_edge_update, edge_updates)
+
+        conn.commit()
+        cursor.close()
+        return {"message": "Cable details updated successfully."}
+
+    except oracledb.Error as e:
+        conn.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:
