@@ -21,6 +21,8 @@ class DeviceBase(BaseModel):
     serial_no: Optional[str] = None
     mac: Optional[str] = None
     ip: Optional[str] = None
+    split_color_grp: Optional[str] = None
+    split_color: Optional[str] = None
     split_ratio: Optional[int] = None
     split_group: Optional[str] = None
     lat1: Optional[float] = None
