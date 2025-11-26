@@ -12,17 +12,16 @@ from models import (
     DeviceBase,
     NodeInsert,
     PositionReset,
-    CustomerIndexItem,
     OnuCustomerInfo,
     DeviceData,
     EdgeData,
     NodeDetailsResponse,
+    TracePathRequest,
+    TracePathResponse,
     NodeDetailsUpdate,
     EdgeCreate,
     EdgeBase,
     DeviceSearchItem,
-    TracePathRequest,
-    TracePathResponse,
 )
 from auth import (
     Token,
@@ -353,9 +352,11 @@ def get_onu_customer_details(
             conn.close()
 
 
-# ---------------------------------------------------------
-# 2. Trace Path Endpoint
-# ---------------------------------------------------------
+# main.py
+
+# ... imports (ensure TracePathRequest, TracePathResponse are imported)
+
+
 @app.post("/trace-path", response_model=TracePathResponse)
 def trace_path(
     request: TracePathRequest, current_user: User = Depends(get_current_user)
@@ -376,38 +377,26 @@ def trace_path(
                     "aid": current_user.area_id,
                 },
             )
-            count = cursor.fetchone()[0]
-            if count < 2:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Permission denied. You do not own both devices.",
-                )
+            if cursor.fetchone()[0] < 2:
+                raise HTTPException(status_code=403, detail="Permission denied.")
 
-        # 2. Recursive CTE to find ALL paths
-        # Removed "FETCH FIRST 1 ROW ONLY" to support multiple branches
+        # 2. Recursive CTE (Unchanged - Finds the spine path)
         sql_path = """
-            WITH edges_bidirectional (u, v) AS (
-                SELECT source_id, target_id FROM ftth_edges
+            WITH path_cte (current_id, path_nodes, path_edges, depth) AS (
+                SELECT :source_id, ',' || :source_id || ',', '', 0 FROM dual
                 UNION ALL
-                SELECT target_id, source_id FROM ftth_edges
-            ),
-            bfs_path (node_id, path_string, depth) AS (
-                -- Anchor
-                SELECT :source_id, ',' || :source_id || ',', 0 FROM dual
-                UNION ALL
-                -- Recursive
-                SELECT e.v, p.path_string || e.v || ',', p.depth + 1
-                FROM edges_bidirectional e
-                JOIN bfs_path p ON e.u = p.node_id
-                WHERE p.path_string NOT LIKE '%,' || e.v || ',%' 
+                SELECT e.target_id, 
+                       p.path_nodes || e.target_id || ',', 
+                       p.path_edges || e.id || ',',
+                       p.depth + 1
+                FROM ftth_edges e
+                JOIN path_cte p ON e.source_id = p.current_id
+                WHERE p.path_nodes NOT LIKE '%,' || e.target_id || ',%' 
                   AND p.depth < 15 
             )
-            -- Get ALL paths that reach the target, ordered by shortness
-            SELECT path_string 
-            FROM bfs_path 
-            WHERE node_id = :target_id 
-            ORDER BY depth ASC
-            FETCH FIRST 1 ROWS ONLY -- Limit to top 5 shortest paths to prevent UI chaos
+            SELECT path_nodes, path_edges 
+            FROM path_cte 
+            WHERE current_id = :target_id
         """
 
         cursor.execute(
@@ -420,65 +409,71 @@ def trace_path(
                 status_code=404, detail="No path found between these devices."
             )
 
-        # 3. Collect Unique IDs from ALL found paths
-        final_ids = set()
+        # 3. Process Paths
+        final_node_ids = set()
+        final_edge_ids = set()
+        intermediate_node_ids = set()
+
         for row in rows:
-            path_string = row[0]
-            # Extract IDs: ",1,2,3," -> [1, 2, 3]
-            ids = [int(x) for x in path_string.strip(",").split(",") if x]
-            final_ids.update(ids)
+            p_nodes = [int(x) for x in row[0].strip(",").split(",") if x]
+            p_edges = [int(x) for x in row[1].strip(",").split(",") if x]
 
-        # 4. Include Others (Siblings/Children of path nodes) - OPTIONAL
-        if request.include_others:
-            path_ids_str = ",".join(str(x) for x in final_ids)
-            if path_ids_str:
-                sql_children = f"""
-                    SELECT target_id FROM ftth_edges WHERE source_id IN ({path_ids_str})
-                    UNION
-                    SELECT source_id FROM ftth_edges WHERE target_id IN ({path_ids_str})
-                """
-                cursor.execute(sql_children)
-                child_rows = cursor.fetchall()
-                for r in child_rows:
-                    final_ids.add(r[0])
+            final_node_ids.update(p_nodes)
+            final_edge_ids.update(p_edges)
 
-        # 5. Fetch Details
-        final_ids_list = list(final_ids)
-        if not final_ids_list:
+            for nid in p_nodes:
+                if nid != request.source_id and nid != request.target_id:
+                    intermediate_node_ids.add(nid)
+
+        # 4. Neighbor Mode Logic - UPDATED
+        if request.include_others and intermediate_node_ids:
+            inter_str = ",".join(str(x) for x in intermediate_node_ids)
+
+            # FIX: Added 'AND PRIOR d.id != :target_id' to stop recursion at the target
+            sql_neighbors = f"""
+                SELECT d.id, e.id as edge_id
+                FROM ftth_devices d
+                LEFT JOIN ftth_edges e ON d.id = e.target_id
+                START WITH d.id IN ({inter_str})
+                CONNECT BY PRIOR d.id = e.source_id
+                       AND PRIOR d.id != :target_id
+            """
+
+            # Need to bind target_id for the CONNECT BY clause
+            cursor.execute(sql_neighbors, {"target_id": request.target_id})
+
+            for r in cursor.fetchall():
+                final_node_ids.add(r[0])
+                if r[1]:
+                    final_edge_ids.add(r[1])
+
+        # 5. Fetch Final Data Objects (Unchanged)
+        if not final_node_ids:
             return {"devices": [], "edges": []}
 
-        ids_str = ",".join(str(x) for x in final_ids_list)
+        nodes_str = ",".join(str(x) for x in final_node_ids)
+        edges_str = ",".join(str(x) for x in final_edge_ids)
 
-        # Fetch Devices
-        sql_devices = f"""
-            SELECT id, name, node_type, sw_id, brand, model, serial_no, 
-                   mac, ip, split_ratio, split_group, split_color, vlan, lat1, long1, 
-                   remarks, position_x, position_y, position_mode,
-                   status, pop_id, container_id, area_id, device_type
-            FROM ftth_devices 
-            WHERE id IN ({ids_str})
-        """
-        cursor.execute(sql_devices)
-        cols_dev = [d[0].lower() for d in cursor.description]
-        devices = [dict(zip(cols_dev, row)) for row in cursor.fetchall()]
+        sql_get_devices = f"SELECT * FROM ftth_devices WHERE id IN ({nodes_str})"
+        cursor.execute(sql_get_devices)
+        cols_d = [d[0].lower() for d in cursor.description]
+        devices = [dict(zip(cols_d, row)) for row in cursor.fetchall()]
 
-        # Fetch Edges
-        # Only fetch edges that connect two nodes present in our final list
-        sql_edges = f"""
-            SELECT id, source_id, target_id, link_type, cable_id, 
-                   cable_start, cable_end, cable_length, 
-                   NVL(cable_color, '#1e293b') as cable_color, cable_desc
-            FROM ftth_edges
-            WHERE source_id IN ({ids_str}) 
-              AND target_id IN ({ids_str})
-        """
-        cursor.execute(sql_edges)
-        cols_edge = [d[0].lower() for d in cursor.description]
-        edges = [dict(zip(cols_edge, row)) for row in cursor.fetchall()]
+        edges = []
+        if edges_str:
+            sql_get_edges = f"""
+                SELECT id, source_id, target_id, link_type, cable_id, cable_start, 
+                       cable_end, cable_length, NVL(cable_color, '#1e293b') as cable_color, cable_desc
+                FROM ftth_edges WHERE id IN ({edges_str})
+            """
+            cursor.execute(sql_get_edges)
+            cols_e = [d[0].lower() for d in cursor.description]
+            edges = [dict(zip(cols_e, row)) for row in cursor.fetchall()]
 
         return {"devices": devices, "edges": edges}
 
     except oracledb.Error as e:
+        print(f"Trace Error: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:

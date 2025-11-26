@@ -19,12 +19,6 @@ class DeviceSearchItem(BaseModel):
         from_attributes = True
 
 
-class TracePathRequest(BaseModel):
-    source_id: int
-    target_id: int
-    include_others: bool = False
-
-
 class DeviceBase(BaseModel):
     """Base fields for a device from ftth_devices."""
 
@@ -91,6 +85,18 @@ class NodeDetailsResponse(BaseModel):
     incoming_edges: List[EdgeData]
     outgoing_edges: List[EdgeData]
 
+
+class TracePathRequest(BaseModel):
+    source_id: int
+    target_id: int
+    include_others: bool = False  # False = Direct, True = Neighboring/Children
+
+
+class TracePathResponse(BaseModel):
+    devices: List[DeviceData]
+    edges: List[EdgeData]
+
+
 class CustomerIndexItem(BaseModel):
     cid: str
     mac: str
@@ -106,11 +112,6 @@ class DeviceUpdate(DeviceBase):
 
     # All fields are optional, inheriting from DeviceBase
     pass
-
-
-class TracePathResponse(BaseModel):
-    devices: List[DeviceData]
-    edges: List[EdgeData]
 
 
 class EdgeUpdate(EdgeBase):
@@ -138,7 +139,7 @@ class OnuCustomerInfo(BaseModel):
     port: Optional[str] = None
     portno: Optional[int] = None
     cid: Optional[Union[str, int]] = None  # Allow both str and int
-    uname: Optional[Union[str, int]] = None # Allow both str and int
+    uname: Optional[Union[str, int]] = None  # Allow both str and int
     expiry_date: Optional[datetime] = None
     mac: Optional[str] = None
     owner: Optional[str] = None
