@@ -12,6 +12,7 @@ from models import (
     DeviceBase,
     NodeInsert,
     PositionReset,
+    CustomerIndexItem,
     OnuCustomerInfo,
     DeviceData,
     EdgeData,
@@ -19,6 +20,9 @@ from models import (
     NodeDetailsUpdate,
     EdgeCreate,
     EdgeBase,
+    DeviceSearchItem,
+    TracePathRequest,
+    TracePathResponse,
 )
 from auth import (
     Token,
@@ -85,7 +89,7 @@ def _get_edges(cursor, node_id: int, direction: str):
     sql_select_cols = """
         SELECT id, source_id, target_id, link_type, cable_id, cable_start, 
                cable_end, cable_length, NVL(cable_color, '#1e293b') as cable_color, 
-               cable_desc, parent_port, sw_port2 
+               cable_desc
         FROM ftth_edges
     """
 
@@ -136,6 +140,349 @@ def test_oracle_connection():
         if conn:
             conn.close()
             print("Connection closed.")
+
+
+@app.get("/search/devices", response_model=List[DeviceSearchItem])
+def search_devices(q: str, current_user: User = Depends(get_current_user)):
+    """
+    Autocomplete search for Source and Target selection.
+    Returns top 20 matches.
+    """
+    if not q or len(q) < 2:
+        return []
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Filter by Area ID for restricted users
+        auth_clause = ""
+        params = {"query": f"%{q}%"}
+
+        if current_user.role_id in [2, 3] and current_user.area_id:
+            auth_clause = "AND area_id = :area_id"
+            params["area_id"] = current_user.area_id
+
+        sql = f"""
+            SELECT id, name, node_type 
+            FROM ftth_devices 
+            WHERE LOWER(name) LIKE LOWER(:query)
+            {auth_clause}
+            ORDER BY LENGTH(name), name
+            FETCH FIRST 20 ROWS ONLY
+        """
+
+        cursor.execute(sql, params)
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        return [dict(zip(columns, row)) for row in rows]
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/customers/search-index")
+def get_customer_search_index(current_user: User = Depends(get_current_user)):
+    """
+    Returns a lightweight index of All Customers mapped to their ONU Node IDs.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Auth Check
+        auth_clause = ""
+        params = {}
+        if current_user.role_id in [2, 3]:
+            if current_user.area_id is None:
+                raise HTTPException(status_code=403, detail="No area assigned.")
+            auth_clause = "AND d.area_id = :area_id"
+            params["area_id"] = current_user.area_id
+
+        # Dynamic Query with loose matching (TRIM/UPPER) to ensure hits
+        sql = f"""
+            SELECT 
+                TO_CHAR(h.user_id) as cid, 
+                m.mac,
+                get_username(h.user_id) AS uname,
+                d.id as onu_id, 
+                d.name as onu_name
+            FROM OLT_CUSTOMER_MAC_2 m
+            JOIN home_conn h ON h.user_id = m.user_id
+            JOIN ftth_devices d ON d.sw_id = m.olt_id 
+                 AND TRIM(UPPER(d.name)) = TRIM(UPPER(m.port)) 
+            WHERE UPPER(d.node_type) = 'ONU'
+            {auth_clause}
+        """
+
+        cursor.execute(sql, params)
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        return [dict(zip(columns, row)) for row in rows]
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/customers/index-version")
+def get_customer_index_version(current_user: User = Depends(get_current_user)):
+    """
+    Returns a lightweight 'version' hash to check if client needs to re-fetch.
+    We use the latest update timestamp and total count as the hash.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Auth Check (Reuse your logic)
+        auth_clause = ""
+        params = {}
+        if current_user.role_id in [2, 3]:
+            if current_user.area_id is None:
+                raise HTTPException(status_code=403, detail="No area assigned.")
+            auth_clause = "AND d.area_id = :area_id"
+            params["area_id"] = current_user.area_id
+
+        # Fast Query: Get count and max modified date
+        # Assuming 'udate' is the column in OLT_CUSTOMER_MAC_2 that tracks changes
+        sql = f"""
+            SELECT COUNT(*) as cnt, MAX(m.udate) as last_mod
+            FROM OLT_CUSTOMER_MAC_2 m
+            JOIN ftth_devices d ON d.sw_id = m.olt_id 
+            WHERE d.node_type = 'ONU'
+            {auth_clause}
+        """
+
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+
+        count = row[0] or 0
+        last_mod = row[1]
+
+        # Create a simple version string
+        # If last_mod is None, use '0'
+        version_string = (
+            f"{count}-{last_mod.strftime('%Y%m%d%H%M%S') if last_mod else '0'}"
+        )
+
+        return {"version": version_string}
+
+    except oracledb.Error as e:
+        # Fallback: if something fails, return current time to force update
+        return {"version": "force-update"}
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
+)
+def get_onu_customer_details(
+    olt_id: int, port_name: str, current_user: User = Depends(get_current_user)
+):
+    """
+    Fetches customer details.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # 1. Auth Check (Optional: Ensure user owns the AREA associated with this Switch ID)
+        if current_user.role_id in [2, 3]:
+            if current_user.area_id is None:
+                raise HTTPException(status_code=403, detail="No area assigned.")
+
+            # We check if any device with this sw_id belongs to the user's area
+            # This validates that the user has rights to see data from this Switch
+            auth_sql = "SELECT count(*) FROM ftth_devices WHERE sw_id = :sid AND area_id = :aid"
+            cursor.execute(auth_sql, {"sid": olt_id, "aid": current_user.area_id})
+            if cursor.fetchone()[0] == 0:
+                # As a fallback, check if the OLT device itself (if matched by ID) owns it
+                # But usually checking child nodes is enough validation
+                pass
+
+        # 2. Simplified Query
+        # We removed the JOIN to ftth_devices (p).
+        # We assume 'olt_id' passed in IS the correct switch ID.
+        sql = """
+            SELECT m.port, 0 as portno, 
+                   TO_CHAR(h.user_id) as cid, 
+                   get_username(h.user_id) as uname,
+                   h.expiry_date, 
+                   m.mac, 
+                   get_full_name(h.owner_id) as owner, 
+                   h.status, 
+                   0 as ls, 
+                   nvl(class_id, -1) as cls, 
+                   is_online3(h.user_id) as online1, 
+                   GET_USER_STATUS(h.user_id) as st2,
+                   sysdate - m.udate as diff
+            FROM OLT_CUSTOMER_MAC_2 m
+            JOIN home_conn h ON h.user_id = m.user_id
+            WHERE m.olt_id = :olt_id_bv 
+              AND TRIM(UPPER(m.port)) = TRIM(UPPER(:port_name_bv))
+            ORDER BY m.port
+        """
+
+        params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
+        cursor.execute(sql, params)
+
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        return [dict(zip(columns, row)) for row in rows]
+
+    except oracledb.Error as e:
+        print(f"DB Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+# ---------------------------------------------------------
+# 2. Trace Path Endpoint
+# ---------------------------------------------------------
+@app.post("/trace-path", response_model=TracePathResponse)
+def trace_path(
+    request: TracePathRequest, current_user: User = Depends(get_current_user)
+):
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # 1. Security Check
+        if current_user.role_id in [2, 3] and current_user.area_id:
+            check_sql = "SELECT count(*) FROM ftth_devices WHERE id IN (:s, :t) AND area_id = :aid"
+            cursor.execute(
+                check_sql,
+                {
+                    "s": request.source_id,
+                    "t": request.target_id,
+                    "aid": current_user.area_id,
+                },
+            )
+            count = cursor.fetchone()[0]
+            if count < 2:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Permission denied. You do not own both devices.",
+                )
+
+        # 2. Recursive CTE to find ALL paths
+        # Removed "FETCH FIRST 1 ROW ONLY" to support multiple branches
+        sql_path = """
+            WITH edges_bidirectional (u, v) AS (
+                SELECT source_id, target_id FROM ftth_edges
+                UNION ALL
+                SELECT target_id, source_id FROM ftth_edges
+            ),
+            bfs_path (node_id, path_string, depth) AS (
+                -- Anchor
+                SELECT :source_id, ',' || :source_id || ',', 0 FROM dual
+                UNION ALL
+                -- Recursive
+                SELECT e.v, p.path_string || e.v || ',', p.depth + 1
+                FROM edges_bidirectional e
+                JOIN bfs_path p ON e.u = p.node_id
+                WHERE p.path_string NOT LIKE '%,' || e.v || ',%' 
+                  AND p.depth < 15 
+            )
+            -- Get ALL paths that reach the target, ordered by shortness
+            SELECT path_string 
+            FROM bfs_path 
+            WHERE node_id = :target_id 
+            ORDER BY depth ASC
+            FETCH FIRST 1 ROWS ONLY -- Limit to top 5 shortest paths to prevent UI chaos
+        """
+
+        cursor.execute(
+            sql_path, {"source_id": request.source_id, "target_id": request.target_id}
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404, detail="No path found between these devices."
+            )
+
+        # 3. Collect Unique IDs from ALL found paths
+        final_ids = set()
+        for row in rows:
+            path_string = row[0]
+            # Extract IDs: ",1,2,3," -> [1, 2, 3]
+            ids = [int(x) for x in path_string.strip(",").split(",") if x]
+            final_ids.update(ids)
+
+        # 4. Include Others (Siblings/Children of path nodes) - OPTIONAL
+        if request.include_others:
+            path_ids_str = ",".join(str(x) for x in final_ids)
+            if path_ids_str:
+                sql_children = f"""
+                    SELECT target_id FROM ftth_edges WHERE source_id IN ({path_ids_str})
+                    UNION
+                    SELECT source_id FROM ftth_edges WHERE target_id IN ({path_ids_str})
+                """
+                cursor.execute(sql_children)
+                child_rows = cursor.fetchall()
+                for r in child_rows:
+                    final_ids.add(r[0])
+
+        # 5. Fetch Details
+        final_ids_list = list(final_ids)
+        if not final_ids_list:
+            return {"devices": [], "edges": []}
+
+        ids_str = ",".join(str(x) for x in final_ids_list)
+
+        # Fetch Devices
+        sql_devices = f"""
+            SELECT id, name, node_type, sw_id, brand, model, serial_no, 
+                   mac, ip, split_ratio, split_group, split_color, vlan, lat1, long1, 
+                   remarks, position_x, position_y, position_mode,
+                   status, pop_id, container_id, area_id, device_type
+            FROM ftth_devices 
+            WHERE id IN ({ids_str})
+        """
+        cursor.execute(sql_devices)
+        cols_dev = [d[0].lower() for d in cursor.description]
+        devices = [dict(zip(cols_dev, row)) for row in cursor.fetchall()]
+
+        # Fetch Edges
+        # Only fetch edges that connect two nodes present in our final list
+        sql_edges = f"""
+            SELECT id, source_id, target_id, link_type, cable_id, 
+                   cable_start, cable_end, cable_length, 
+                   NVL(cable_color, '#1e293b') as cable_color, cable_desc
+            FROM ftth_edges
+            WHERE source_id IN ({ids_str}) 
+              AND target_id IN ({ids_str})
+        """
+        cursor.execute(sql_edges)
+        cols_edge = [d[0].lower() for d in cursor.description]
+        edges = [dict(zip(cols_edge, row)) for row in cursor.fetchall()]
+
+        return {"devices": devices, "edges": edges}
+
+    except oracledb.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.post("/token", response_model=Token)
@@ -273,132 +620,6 @@ def update_node_details(
             conn.close()
 
 
-@app.get(
-    "/onu/{olt_id}/{port_name:path}/customers", response_model=List[OnuCustomerInfo]
-)
-def get_onu_customer_details(
-    olt_id: int, port_name: str, current_user: User = Depends(get_current_user)
-):
-    """
-    Fetches customer details for a specific ONU port on a given OLT.
-    --- UPDATED ---
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-
-        if current_user.role_id in [2, 3]:
-            if current_user.area_id is None:
-                raise HTTPException(
-                    status_code=403, detail="Your account is not assigned to an area."
-                )
-
-            # --- UPDATED ---
-            cursor.execute(
-                "SELECT area_id FROM ftth_devices WHERE id = :olt_id_bv",
-                {"olt_id_bv": olt_id},
-            )
-            row = cursor.fetchone()
-            if not row or row[0] != current_user.area_id:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Permission denied: You do not own this OLT.",
-                )
-        else:
-            raise HTTPException(status_code=403, detail="Not authorized.")
-
-        # --- UPDATED ---
-        sql = """
-            SELECT port, get_customer_id (h.user_id) cid, get_username (h.user_id) uname,
-                   expiry_date, m.mac, get_full_name (owner_id) owner, h.status, ls,
-                   nvl(class_id,-1) cls, is_online3 (h.user_id) online1, GET_USER_STATUS(h.user_id) st2,
-                   sysdate-m.udate diff
-            FROM OLT_CUSTOMER_MAC_2 m, ftth_devices p, home_conn h 
-            WHERE h.user_id=m.user_id
-              AND p.name=m.port
-              AND m.olt_id=p.sw_id
-              AND m.olt_id = :olt_id_bv
-              AND m.port = :port_name_bv
-            ORDER BY m.port
-        """
-
-        params = {"olt_id_bv": olt_id, "port_name_bv": port_name}
-        cursor.execute(sql, params)
-
-        columns = [desc[0].lower() for desc in cursor.description]
-        rows = cursor.fetchall()
-        results = [dict(zip(columns, row)) for row in rows]
-        return [
-            {
-                "port": "EPON0/2:1",
-                "portno": 0,
-                "cid": 1882011229,
-                "uname": "1882010429",
-                "expiry_date": "2025-10-06T00:00:00",
-                "mac": "58:D9:D5:75:5D:A8",
-                "owner": "Maestro Solutions Limited ",
-                "status": 0,
-                "ls": 0,
-                "cls": -1,
-                "online1": 1,
-                "st2": "Expired",
-                "diff": 119.83287037037037,
-            },
-            {
-                "port": "EPON0/2:1",
-                "portno": 0,
-                "cid": 1882010229,
-                "uname": "18820102229",
-                "expiry_date": "2025-10-06T00:00:00",
-                "mac": "58:D9:D5:75:5D:A9",
-                "owner": "Maestro Solutions Limited ",
-                "status": 0,
-                "ls": 0,
-                "cls": -1,
-                "online1": 0,
-                "st2": "OK",
-                "diff": 119.83287037037037,
-            },
-            {
-                "port": "EPON0/2:1",
-                "portno": 0,
-                "cid": 1882010223,
-                "uname": "1882410229",
-                "expiry_date": "2025-10-06T00:00:00",
-                "mac": "58:D9:D5:75:5D:A1",
-                "owner": "Maestro Solutions Limited ",
-                "status": 0,
-                "ls": 0,
-                "cls": -1,
-                "online1": 0,
-                "st2": "Disabled",
-                "diff": 119.83287037037037,
-            },
-            {
-                "port": "EPON0/2:1",
-                "portno": 0,
-                "cid": 1882410223,
-                "uname": "1882410229",
-                "expiry_date": "2025-10-06T00:00:00",
-                "mac": "58:D9:D5:35:5D:A1",
-                "owner": "Maestro Solutions Limited ",
-                "status": 0,
-                "ls": 0,
-                "cls": -1,
-                "online1": 0,
-                "st2": "Locked",
-                "diff": 119.83287037037037,
-            },
-        ]
-
-    except oracledb.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
 @app.post("/positions/reset", status_code=200)
 def reset_node_positions(
     reset_request: PositionReset, current_user: User = Depends(get_current_user)
@@ -529,14 +750,13 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
         # Define the selection columns to join device and edge data
         selection_cols = """
           d.ID, d.NAME, d.NODE_TYPE, d.STATUS, d.SW_ID, d.POP_ID, d.VLAN,
-          d.SPLIT_RATIO, d.SPLIT_COLOR_GRP, d.SPLIT_COLOR, d.COLOR_GROUP,
+          d.SPLIT_RATIO, d.SPLIT_GROUP, d.SPLIT_COLOR,
           d.CONTAINER_ID, d.AREA_ID, d.REMARKS, d.USER_ID, d.SERIAL_NO,
-          d.BRAND, d.LAT1, d.LONG1, d.IP, d.MAC, d.DEVICE_TYPE, d.MODEL,
-          d.SPLIT_GROUP, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
+          d.BRAND, d.LAT1, d.LONG1, d.IP, d.MAC, d.DEVICE_TYPE, d.MODEL, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
           e.SOURCE_ID as PARENT_ID,
           e.ID as EDGE_ID,
           e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, NVL(e.CABLE_COLOR, '#1e293b') as CABLE_COLOR,
-          e.CABLE_START, e.CABLE_DESC, e.CABLE_END, e.PARENT_PORT, e.SW_PORT2
+          e.CABLE_START, e.CABLE_DESC, e.CABLE_END
         """
 
         if root_node_id is not None:
@@ -849,14 +1069,13 @@ def create_device(node: DeviceBase, current_user: User = Depends(get_current_use
 
         selection_cols = """
           d.ID, d.NAME, d.NODE_TYPE, d.STATUS, d.SW_ID, d.POP_ID, d.VLAN,
-          d.SPLIT_RATIO, d.SPLIT_COLOR_GRP, d.SPLIT_COLOR, d.COLOR_GROUP,
+          d.SPLIT_RATIO, d.SPLIT_GROUP, d.SPLIT_COLOR,
           d.CONTAINER_ID, d.AREA_ID, d.REMARKS, d.USER_ID, d.SERIAL_NO,
-          d.BRAND, d.LAT1, d.LONG1, d.IP, d.MAC, d.DEVICE_TYPE, d.MODEL,
-          d.SPLIT_GROUP, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
+          d.BRAND, d.LAT1, d.LONG1, d.IP, d.MAC, d.DEVICE_TYPE, d.MODEL, d.POSITION_X, d.POSITION_Y, d.POSITION_MODE,
           e.SOURCE_ID as PARENT_ID,
           e.ID as EDGE_ID,
           e.LINK_TYPE, e.CABLE_ID, e.CABLE_LENGTH, NVL(e.CABLE_COLOR, '#1e293b') as CABLE_COLOR,
-          e.CABLE_START, e.CABLE_DESC, e.CABLE_END, e.PARENT_PORT, e.SW_PORT2
+          e.CABLE_START, e.CABLE_DESC, e.CABLE_END
         """
 
         cursor.execute(

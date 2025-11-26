@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 
 
@@ -8,6 +8,21 @@ class EdgeCreate(BaseModel):
     target_id: int
     link_type: Optional[str] = "Fiber Optic"
     cable_color: Optional[str] = "#1e293b"
+
+
+class DeviceSearchItem(BaseModel):
+    id: int
+    name: str
+    node_type: str
+
+    class Config:
+        from_attributes = True
+
+
+class TracePathRequest(BaseModel):
+    source_id: int
+    target_id: int
+    include_others: bool = False
 
 
 class DeviceBase(BaseModel):
@@ -21,7 +36,6 @@ class DeviceBase(BaseModel):
     serial_no: Optional[str] = None
     mac: Optional[str] = None
     ip: Optional[str] = None
-    split_color_grp: Optional[str] = None
     split_color: Optional[str] = None
     split_ratio: Optional[int] = None
     split_group: Optional[str] = None
@@ -33,10 +47,8 @@ class DeviceBase(BaseModel):
     position_x: Optional[float] = None
     position_y: Optional[float] = None
     position_mode: Optional[int] = None
-    # --- Add any other fields from your ftth_devices table ---
     status: Optional[int] = None
     pop_id: Optional[int] = None
-    color_group: Optional[str] = None
     container_id: Optional[int] = None
     area_id: Optional[int] = None
     device_type: Optional[str] = None
@@ -54,20 +66,17 @@ class EdgeBase(BaseModel):
     cable_desc: Optional[str] = None
 
 
-# --- Models for GET /node-details/{node_id} ---
-
-
 class DeviceData(DeviceBase):
     """Device data returned from the API."""
 
     id: int
-    name: str  # Make name required in the response
+    name: str
 
 
 class EdgeData(EdgeBase):
     """Edge data returned from the API."""
 
-    id: int  # The edge's primary key
+    id: int
     source_id: int
     target_id: int
 
@@ -82,6 +91,12 @@ class NodeDetailsResponse(BaseModel):
     incoming_edges: List[EdgeData]
     outgoing_edges: List[EdgeData]
 
+class CustomerIndexItem(BaseModel):
+    cid: str
+    mac: str
+    onu_id: int
+    onu_name: str
+
 
 # --- Models for PUT /node-details/{node_id} ---
 
@@ -91,6 +106,11 @@ class DeviceUpdate(DeviceBase):
 
     # All fields are optional, inheriting from DeviceBase
     pass
+
+
+class TracePathResponse(BaseModel):
+    devices: List[DeviceData]
+    edges: List[EdgeData]
 
 
 class EdgeUpdate(EdgeBase):
@@ -117,8 +137,8 @@ class NodeDetailsUpdate(BaseModel):
 class OnuCustomerInfo(BaseModel):
     port: Optional[str] = None
     portno: Optional[int] = None
-    cid: Optional[int] = None
-    uname: Optional[str] = None
+    cid: Optional[Union[str, int]] = None  # Allow both str and int
+    uname: Optional[Union[str, int]] = None # Allow both str and int
     expiry_date: Optional[datetime] = None
     mac: Optional[str] = None
     owner: Optional[str] = None
