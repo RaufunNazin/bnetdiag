@@ -1,4 +1,3 @@
-# main.py
 from typing import Any, Dict, List
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -62,7 +61,6 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
                 detail="Your account is not assigned to an area.",
             )
 
-        # --- UPDATED ---
         sql = "SELECT area_id FROM ftth_devices WHERE id = :node_id"
         cursor.execute(sql, {"node_id": node_id})
         row = cursor.fetchone()
@@ -83,8 +81,6 @@ def _check_node_ownership(node_id: int, current_user: User, cursor: oracledb.Cur
 def _get_edges(cursor, node_id: int, direction: str):
     """Helper function to get incoming or outgoing edges."""
 
-    # --- UPDATED ---
-    # Explicitly select columns and use NVL for cable_color
     sql_select_cols = """
         SELECT id, source_id, target_id, link_type, cable_id, cable_start, 
                cable_end, cable_length, NVL(cable_color, '#1e293b') as cable_color, 
@@ -94,7 +90,7 @@ def _get_edges(cursor, node_id: int, direction: str):
 
     if direction == "incoming":
         sql = f"{sql_select_cols} WHERE target_id = :node_id"
-    else:  # "outgoing"
+    else:
         sql = f"{sql_select_cols} WHERE source_id = :node_id"
 
     cursor.execute(sql, {"node_id": node_id})
@@ -155,7 +151,6 @@ def search_devices(q: str, current_user: User = Depends(get_current_user)):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Filter by Area ID for restricted users
         auth_clause = ""
         params = {"query": f"%{q}%"}
 
@@ -195,7 +190,6 @@ def get_customer_search_index(current_user: User = Depends(get_current_user)):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Auth Check
         auth_clause = ""
         params = {}
         if current_user.role_id in [2, 3]:
@@ -204,7 +198,6 @@ def get_customer_search_index(current_user: User = Depends(get_current_user)):
             auth_clause = "AND d.area_id = :area_id"
             params["area_id"] = current_user.area_id
 
-        # Dynamic Query with loose matching (TRIM/UPPER) to ensure hits
         sql = f"""
             SELECT 
                 TO_CHAR(h.user_id) as cid, 
@@ -244,7 +237,6 @@ def get_customer_index_version(current_user: User = Depends(get_current_user)):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Auth Check (Reuse your logic)
         auth_clause = ""
         params = {}
         if current_user.role_id in [2, 3]:
@@ -253,8 +245,6 @@ def get_customer_index_version(current_user: User = Depends(get_current_user)):
             auth_clause = "AND d.area_id = :area_id"
             params["area_id"] = current_user.area_id
 
-        # Fast Query: Get count and max modified date
-        # Assuming 'udate' is the column in OLT_CUSTOMER_MAC_2 that tracks changes
         sql = f"""
             SELECT COUNT(*) as cnt, MAX(m.udate) as last_mod
             FROM OLT_CUSTOMER_MAC_2 m
@@ -269,8 +259,6 @@ def get_customer_index_version(current_user: User = Depends(get_current_user)):
         count = row[0] or 0
         last_mod = row[1]
 
-        # Create a simple version string
-        # If last_mod is None, use '0'
         version_string = (
             f"{count}-{last_mod.strftime('%Y%m%d%H%M%S') if last_mod else '0'}"
         )
@@ -278,7 +266,6 @@ def get_customer_index_version(current_user: User = Depends(get_current_user)):
         return {"version": version_string}
 
     except oracledb.Error as e:
-        # Fallback: if something fails, return current time to force update
         return {"version": "force-update"}
     finally:
         if conn:
@@ -299,23 +286,15 @@ def get_onu_customer_details(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # 1. Auth Check (Optional: Ensure user owns the AREA associated with this Switch ID)
         if current_user.role_id in [2, 3]:
             if current_user.area_id is None:
                 raise HTTPException(status_code=403, detail="No area assigned.")
 
-            # We check if any device with this sw_id belongs to the user's area
-            # This validates that the user has rights to see data from this Switch
             auth_sql = "SELECT count(*) FROM ftth_devices WHERE sw_id = :sid AND area_id = :aid"
             cursor.execute(auth_sql, {"sid": olt_id, "aid": current_user.area_id})
             if cursor.fetchone()[0] == 0:
-                # As a fallback, check if the OLT device itself (if matched by ID) owns it
-                # But usually checking child nodes is enough validation
                 pass
 
-        # 2. Simplified Query
-        # We removed the JOIN to ftth_devices (p).
-        # We assume 'olt_id' passed in IS the correct switch ID.
         sql = """
             SELECT m.port, 0 as portno, 
                    TO_CHAR(h.user_id) as cid, 
@@ -352,11 +331,6 @@ def get_onu_customer_details(
             conn.close()
 
 
-# main.py
-
-# ... imports (ensure TracePathRequest, TracePathResponse are imported)
-
-
 @app.post("/trace-path", response_model=TracePathResponse)
 def trace_path(
     request: TracePathRequest, current_user: User = Depends(get_current_user)
@@ -366,7 +340,6 @@ def trace_path(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # 1. Security Check
         if current_user.role_id in [2, 3] and current_user.area_id:
             check_sql = "SELECT count(*) FROM ftth_devices WHERE id IN (:s, :t) AND area_id = :aid"
             cursor.execute(
@@ -380,7 +353,6 @@ def trace_path(
             if cursor.fetchone()[0] < 2:
                 raise HTTPException(status_code=403, detail="Permission denied.")
 
-        # 2. Recursive CTE (Unchanged - Finds the spine path)
         sql_path = """
             WITH path_cte (current_id, path_nodes, path_edges, depth) AS (
                 SELECT :source_id, ',' || :source_id || ',', '', 0 FROM dual
@@ -409,7 +381,6 @@ def trace_path(
                 status_code=404, detail="No path found between these devices."
             )
 
-        # 3. Process Paths
         final_node_ids = set()
         final_edge_ids = set()
         intermediate_node_ids = set()
@@ -425,11 +396,9 @@ def trace_path(
                 if nid != request.source_id and nid != request.target_id:
                     intermediate_node_ids.add(nid)
 
-        # 4. Neighbor Mode Logic - UPDATED
         if request.include_others and intermediate_node_ids:
             inter_str = ",".join(str(x) for x in intermediate_node_ids)
 
-            # FIX: Added 'AND PRIOR d.id != :target_id' to stop recursion at the target
             sql_neighbors = f"""
                 SELECT d.id, e.id as edge_id
                 FROM ftth_devices d
@@ -439,7 +408,6 @@ def trace_path(
                        AND PRIOR d.id != :target_id
             """
 
-            # Need to bind target_id for the CONNECT BY clause
             cursor.execute(sql_neighbors, {"target_id": request.target_id})
 
             for r in cursor.fetchall():
@@ -447,7 +415,6 @@ def trace_path(
                 if r[1]:
                     final_edge_ids.add(r[1])
 
-        # 5. Fetch Final Data Objects (Unchanged)
         if not final_node_ids:
             return {"devices": [], "edges": []}
 
@@ -511,9 +478,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-# ---
-# NEW ENDPOINT: To get all data for the Edit Modal
-# ---
 @app.get("/node-details/{node_id}", response_model=NodeDetailsResponse)
 def get_node_details(node_id: int, current_user: User = Depends(get_current_user)):
     """
@@ -525,7 +489,6 @@ def get_node_details(node_id: int, current_user: User = Depends(get_current_user
         conn = get_connection()
         cursor = conn.cursor()
 
-        # 1. Get Device Details
         sql_device = "SELECT * FROM ftth_devices WHERE id = :node_id"
         cursor.execute(sql_device, {"node_id": node_id})
         columns = [desc[0].lower() for desc in cursor.description]
@@ -536,15 +499,12 @@ def get_node_details(node_id: int, current_user: User = Depends(get_current_user
 
         device_data = dict(zip(columns, device_row))
 
-        # 2. Get Incoming Edges
         incoming_edges_data = _get_edges(cursor, node_id, "incoming")
 
-        # 3. Get Outgoing Edges
         outgoing_edges_data = _get_edges(cursor, node_id, "outgoing")
 
         cursor.close()
 
-        # 4. Parse and return using Pydantic models
         return NodeDetailsResponse(
             device=parse_obj_as(DeviceData, device_data),
             incoming_edges=parse_obj_as(List[EdgeData], incoming_edges_data),
@@ -558,10 +518,6 @@ def get_node_details(node_id: int, current_user: User = Depends(get_current_user
             conn.close()
 
 
-# ---
-# NEW ENDPOINT: To save all data from the Edit Modal
-# This REPLACES your old 'saveNodeInfo' endpoint
-# ---
 @app.put("/node-details/{node_id}")
 def update_node_details(
     node_id: int,
@@ -576,8 +532,6 @@ def update_node_details(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # 1. Update the Device
-        # Build the SET clause for the device
         device_updates = payload.device_data.dict(exclude_unset=True)
         if device_updates:
             set_clause = ", ".join([f"{key} = :{key}" for key in device_updates.keys()])
@@ -585,20 +539,17 @@ def update_node_details(
                 f"UPDATE ftth_devices SET {set_clause} WHERE id = :node_id"
             )
 
-            # Add node_id to the params and execute
             device_updates["node_id"] = node_id
             cursor.execute(sql_device_update, device_updates)
 
-        # 2. Update the Edges
         for edge_data in payload.edges_to_update:
             edge_updates = edge_data.dict(exclude_unset=True, exclude={"id"})
             if not edge_updates:
-                continue  # Nothing to update for this edge
+                continue
 
             set_clause = ", ".join([f"{key} = :{key}" for key in edge_updates.keys()])
             sql_edge_update = f"UPDATE ftth_edges SET {set_clause} WHERE id = :edge_id"
 
-            # Add edge_id to the params and execute
             edge_updates["edge_id"] = edge_data.id
             cursor.execute(sql_edge_update, edge_updates)
 
@@ -608,7 +559,7 @@ def update_node_details(
         return {"message": "Update successful"}
 
     except oracledb.Error as e:
-        conn.rollback()  # Rollback changes on error
+        conn.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         if conn:
@@ -621,9 +572,7 @@ def reset_node_positions(
 ):
     """
     Resets device positions based on the provided scope.
-    --- UPDATED ---
     """
-    # --- UPDATED ---
     base_sql = """
         UPDATE ftth_devices
         SET position_x = NULL,
@@ -651,7 +600,6 @@ def reset_node_positions(
             where_clauses.append("sw_id = :sw_id")
             params["sw_id"] = reset_request.sw_id
         else:
-            # --- UPDATED ---
             general_view_clause = """
             (node_type NOT IN ('PON', 'ONU') AND NOT EXISTS (
                 SELECT 1 FROM ftth_edges e WHERE e.target_id = id
@@ -715,7 +663,6 @@ async def read_general_data(current_user: User = Depends(get_current_user)):
 def read_data(root_node_id: int, current_user: User = Depends(get_current_user)):
     """
     Endpoint to get a specific node and all its descendants.
-    --- UPDATED ---
     Re-joins devices and edges to simulate the old 'nodes' table structure.
     """
     conn = None
@@ -736,13 +683,10 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
                 detail="Your account is not assigned to an area.",
             )
 
-        # --- UPDATED ---
         auth_clause = " AND d.area_id = :user_area_id"
         auth_clause_connect_by = " AND PRIOR d.area_id = :user_area_id"
         params["user_area_id"] = current_user.area_id
 
-        # --- UPDATED ---
-        # Define the selection columns to join device and edge data
         selection_cols = """
           d.ID, d.NAME, d.NODE_TYPE, d.STATUS, d.SW_ID, d.POP_ID, d.VLAN,
           d.SPLIT_RATIO, d.SPLIT_GROUP, d.SPLIT_COLOR,
@@ -758,13 +702,9 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
             _check_node_ownership(root_node_id, current_user, cursor)
             params["root_node_id_bv"] = root_node_id
 
-            # Auth clauses for subqueries
             auth_clause_sub = auth_clause.replace(" d.", " d2.")
             auth_clause_connect_by_sub = auth_clause_connect_by.replace(" d.", " d2.")
 
-            # --- UPDATED ---
-            # This query joins devices and edges and uses the edge (parent)
-            # to build the hierarchy.
             sql = f"""
                 SELECT {selection_cols}
                 FROM ftth_devices d
@@ -787,8 +727,6 @@ def read_data(root_node_id: int, current_user: User = Depends(get_current_user))
                 ) {auth_clause}
             """
         else:
-            # --- UPDATED ---
-            # General view query, also joining devices and edges
             sql = f"""
                 SELECT {selection_cols}
                 FROM ftth_devices d
@@ -830,7 +768,6 @@ def get_root_candidates(current_user: User = Depends(get_current_user)):
         conn = get_connection()
         cursor = conn.cursor()
 
-        # --- UPDATED ---
         sql = """
             SELECT id, name FROM ftth_devices 
             WHERE node_type IN ('Router', 'Managed Switch', 'Unmanaged Switch')
@@ -857,9 +794,7 @@ def insert_node(
 ):
     """
     Inserts a new device between two existing devices.
-    --- UPDATED ---
     """
-    # --- UPDATED ---
     plsql_block = """
         DECLARE
             v_new_device_id       ftth_devices.id%TYPE;
@@ -1358,7 +1293,6 @@ def create_edge(edge: EdgeCreate, current_user: User = Depends(get_current_user)
         params = edge.dict()
         params["area_id"] = current_user.area_id
 
-        # Add defaults if not provided (though model has them, good to be safe)
         if not params.get("link_type"):
             params["link_type"] = "Fiber Optic"
         if not params.get("cable_color"):
@@ -1375,12 +1309,12 @@ def create_edge(edge: EdgeCreate, current_user: User = Depends(get_current_user)
                 status_code=403,
                 detail="Permission denied. Both components must be in your area.",
             )
-        if error.code == 1:  # Unique constraint
+        if error.code == 1:
             raise HTTPException(
                 status_code=409,
                 detail="This connection already exists.",
             )
-        if error.code == 1403:  # No data found
+        if error.code == 1403:
             raise HTTPException(
                 status_code=404,
                 detail="Source or target device not found.",
@@ -1401,7 +1335,6 @@ def get_edge_details(edge_id: int, current_user: User = Depends(get_current_user
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Check permission on the source node of the edge
         sql_perm = """
             SELECT d.area_id 
             FROM ftth_devices d
@@ -1417,7 +1350,6 @@ def get_edge_details(edge_id: int, current_user: User = Depends(get_current_user
                 detail="Permission denied: You do not have access to this cable.",
             )
 
-        # Get edge details
         sql_edge = "SELECT * FROM ftth_edges WHERE id = :edge_id"
         cursor.execute(sql_edge, {"edge_id": edge_id})
         columns = [desc[0].lower() for desc in cursor.description]
@@ -1450,7 +1382,6 @@ def update_edge_details(
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Check permission on the source node of the edge
         sql_perm = """
             SELECT d.area_id 
             FROM ftth_devices d
@@ -1466,7 +1397,6 @@ def update_edge_details(
                 detail="Permission denied: You do not have access to this cable.",
             )
 
-        # Update the edge
         edge_updates = payload.dict(exclude_unset=True)
         if not edge_updates:
             return {"message": "No data provided to update."}

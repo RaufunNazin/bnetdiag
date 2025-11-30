@@ -89,7 +89,7 @@ class NodeDetailsResponse(BaseModel):
 class TracePathRequest(BaseModel):
     source_id: int
     target_id: int
-    include_others: bool = False  # False = Direct, True = Neighboring/Children
+    include_others: bool = False
 
 
 class TracePathResponse(BaseModel):
@@ -104,20 +104,16 @@ class CustomerIndexItem(BaseModel):
     onu_name: str
 
 
-# --- Models for PUT /node-details/{node_id} ---
-
-
 class DeviceUpdate(DeviceBase):
     """Payload for updating just the device fields."""
 
-    # All fields are optional, inheriting from DeviceBase
     pass
 
 
 class EdgeUpdate(EdgeBase):
     """Payload for updating a single edge."""
 
-    id: int  # Required to know *which* edge to update in the DB
+    id: int
 
 
 class NodeDetailsUpdate(BaseModel):
@@ -127,19 +123,14 @@ class NodeDetailsUpdate(BaseModel):
     """
 
     device_data: DeviceUpdate
-    edges_to_update: List[EdgeUpdate]  # A list of all edges that were modified
-
-
-# =======================================================
-# === Other Models (Unchanged) ==========================
-# =======================================================
+    edges_to_update: List[EdgeUpdate]
 
 
 class OnuCustomerInfo(BaseModel):
     port: Optional[str] = None
     portno: Optional[int] = None
-    cid: Optional[Union[str, int]] = None  # Allow both str and int
-    uname: Optional[Union[str, int]] = None  # Allow both str and int
+    cid: Optional[Union[str, int]] = None
+    uname: Optional[Union[str, int]] = None
     expiry_date: Optional[datetime] = None
     mac: Optional[str] = None
     owner: Optional[str] = None
